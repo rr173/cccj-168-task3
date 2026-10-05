@@ -1,0 +1,557 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>剂量递增安全决策平台 · 安全工作台</title>
+<style>
+  :root{--bg:#0f172a;--panel:#1e293b;--line:#334155;--text:#e2e8f0;--mut:#94a3b8;
+        --ok:#22c55e;--warn:#f59e0b;--bad:#ef4444;--info:#38bdf8;--accent:#818cf8}
+  *{box-sizing:border-box} body{margin:0;background:var(--bg);color:var(--text);
+    font:14px/1.5 -apple-system,"PingFang SC","Microsoft YaHei",sans-serif}
+  header{padding:10px 18px;background:#111c33;border-bottom:1px solid var(--line);
+    display:flex;gap:16px;align-items:center;flex-wrap:wrap}
+  header h1{font-size:16px;margin:0} .mut{color:var(--mut);font-size:12px}
+  .wrap{display:grid;grid-template-columns:300px 1fr 420px;gap:12px;padding:12px}
+  .panel{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:12px;overflow:auto}
+  .panel h2{font-size:13px;margin:0 0 8px;color:var(--accent);text-transform:uppercase;letter-spacing:.5px}
+  .row{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin:6px 0}
+  button{background:var(--accent);color:#0f172a;border:0;border-radius:6px;padding:6px 12px;
+    font-weight:600;cursor:pointer;font-size:13px}
+  button.ghost{background:transparent;color:var(--text);border:1px solid var(--line)}
+  button.danger{background:var(--bad);color:#fff} button.ok{background:var(--ok);color:#052e16}
+  button:disabled{opacity:.45;cursor:not-allowed}
+  input,select,textarea{background:#0b1220;border:1px solid var(--line);color:var(--text);
+    border-radius:6px;padding:5px 8px;font-size:13px;width:100%}
+  .item{border:1px solid var(--line);border-radius:8px;padding:8px;margin:6px 0;cursor:pointer}
+  .item.sel{border-color:var(--accent);background:#283449}
+  .tag{display:inline-block;padding:1px 8px;border-radius:99px;font-size:11px;font-weight:700}
+  .t-draft{background:#475569}.t-active{background:#0369a1}.t-closed{background:#334155}
+  .t-stopped{background:#991b1b}.t-ok{background:#166534}.t-bad{background:#991b1b}
+  .t-warn{background:#92400e}.t-info{background:#075985}
+  table{width:100%;border-collapse:collapse;font-size:12.5px}
+  th,td{border-bottom:1px solid var(--line);padding:5px 6px;text-align:left;vertical-align:top}
+  th{color:var(--mut);font-weight:600}
+  .gate{display:flex;gap:8px;align-items:flex-start;padding:5px 0}
+  .dot{width:10px;height:10px;border-radius:50%;margin-top:5px;flex:0 0 auto}
+  .dot.on{background:var(--ok)}.dot.off{background:var(--bad)}
+  pre{background:#0b1220;border:1px solid var(--line);border-radius:8px;padding:8px;
+    font-size:11.5px;overflow:auto;max-height:340px;white-space:pre-wrap;word-break:break-all}
+  .grid2{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+  .toast{position:fixed;right:16px;bottom:16px;max-width:480px;z-index:9}
+  .toast div{padding:10px 14px;border-radius:8px;margin-top:8px;border:1px solid var(--line);background:#111c33}
+  .toast .err{border-color:var(--bad)}.toast .msg{border-color:var(--ok)}
+  .small{font-size:12px}.mono{font-family:ui-monospace,Menlo,monospace;font-size:11.5px}
+  .sup{color:var(--bad);font-weight:700}.fresh{color:var(--ok)}
+</style>
+</head>
+<body>
+<header>
+  <h1>🧪 剂量递增安全决策平台</h1>
+  <span class="mut">当前时间</span><b id="clock">—</b>
+  <button class="ghost" onclick="tick('2026-10-22T10:01:00+00:00')">推进到窗口结束</button>
+  <input id="customTick" value="2026-10-22T10:01:00+00:00" style="width:230px">
+  <button class="ghost" onclick="tick(document.getElementById('customTick').value)">自定义推进</button>
+  <span class="tag" id="chainTag">链校验</span>
+  <span class="tag t-ok" id="netTag">🟢 在线</span>
+  <button class="ghost" id="netBtn" onclick="toggleOffline()">模拟断网</button>
+  <button class="ghost" onclick="seedDemo()">载入演示数据</button>
+  <button class="ghost" onclick="load()">刷新</button>
+</header>
+<div class="wrap">
+  <!-- 左：队列 -->
+  <div class="panel" id="left"></div>
+  <!-- 中：队列工作台 -->
+  <div class="panel" id="center"><h2>安全工作台</h2><p class="mut">选择一个队列开始；或先载入演示数据。</p></div>
+  <!-- 右：快照 / 决策证明 -->
+  <div class="panel" id="right"><h2>快照与决策证明</h2><p class="mut">队列决策流程显示在这里。</p></div>
+</div>
+<div class="toast" id="toast"></div>
+
+<script>
+const API = '';
+let S = null, CID = null, SID = null, DID = null;
+let OFFLINE = false;
+
+async function api(method, path, body){
+  if(OFFLINE) throw Object.assign(new Error('断网模拟中：请求未发送'),{code:'offline'});
+  const opt = {method, headers:{'Content-Type':'application/json','X-Actor':'workbench'}};
+  if(body) opt.body = JSON.stringify(body);
+  let r;
+  try{ r = await fetch(API+path, opt); }
+  catch(err){
+    setOffline(true);
+    throw Object.assign(new Error('网络不可达：已切换断网状态，投票可存为本地草稿'),{code:'offline'});
+  }
+  const j = await r.json().catch(()=>({}));
+  if(!r.ok) throw Object.assign(new Error(j.message||r.statusText),{code:j.error,body:j});
+  return j;
+}
+function setOffline(v){
+  OFFLINE=v;
+  const t=document.getElementById('netTag');
+  t.textContent=v?'🔴 断网（草稿本地保存）':'🟢 在线';
+  t.className='tag '+(v?'t-bad':'t-ok');
+  document.getElementById('netBtn').textContent=v?'恢复网络':'模拟断网';
+}
+function toggleOffline(){
+  setOffline(!OFFLINE);
+  toast(OFFLINE?'已断网：实时操作不可用，可在快照详情「存为断网草稿」':'网络已恢复：请到队列工作台提交「待提交」草稿');
+  if(!OFFLINE) load(); else renderCenter();
+}
+function toast(msg, isErr){
+  const box=document.getElementById('toast');
+  const d=document.createElement('div'); d.className=isErr?'err':'msg';
+  d.textContent=(isErr?'⛔ ':'✓ ')+msg; box.appendChild(d);
+  setTimeout(()=>d.remove(), isErr?6500:3500);
+}
+async function act(label, fn){
+  try{ const r=await fn(); toast(label+' 成功'); await load(); return r; }
+  catch(e){ toast(label+'失败：'+e.message, true); }
+}
+async function seedDemo(){ await act('演示数据', ()=>api('POST','/api/demo/seed',{})); selectCohortAuto(); }
+async function tick(ts){ await act('时钟推进', ()=>api('POST','/api/clock',{now:ts})); }
+async function load(){
+  try{ S = await api('GET','/api/state'); }
+  catch(e){ if(e.code!=='offline') toast('状态刷新失败：'+e.message,true); }
+  if(!S) return;
+  renderLeft(); renderCenter(); renderRight();
+  document.getElementById('clock').textContent=S.now.replace('T',' ').slice(0,19)+' UTC';
+  const tag=document.getElementById('chainTag');
+  tag.textContent='哈希链 '+S.journal.events+' 事件';
+  tag.className='tag '+(S.journal.chain_ok?'t-ok':'t-bad');
+}
+function selectCohortAuto(){
+  setTimeout(()=>{ const c=(S&&S.cohorts[0])?.cohort_id; if(c){CID=c;load();} }, 200);
+}
+function esc(s){return String(s??'').replace(/[&<>"]/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[m]))}
+function statusTag(s){return `<span class="tag t-${s}">${({draft:'草案',active:'进行中',closed:'已关闭',stopped:'已停止'})[s]||s}</span>`}
+
+// ---------------- 断网投票草稿（localStorage 本地队列） ----------------
+const DKEY='voteDrafts.v1';
+function loadDrafts(){ try{ return JSON.parse(localStorage.getItem(DKEY))||[]; }catch(e){ return []; } }
+function saveDrafts(d){ localStorage.setItem(DKEY, JSON.stringify(d)); }
+function uid(){ return 'DR-'+(crypto.randomUUID?crypto.randomUUID().slice(0,8):Date.now().toString(36)); }
+// 与服务端 canonical_json 一致：键排序、无空白、非 ASCII 不转义
+function canonicalJson(o){
+  if(o===null||typeof o!=='object') return JSON.stringify(o);
+  if(Array.isArray(o)) return '['+o.map(canonicalJson).join(',')+']';
+  return '{'+Object.keys(o).sort().map(k=>JSON.stringify(k)+':'+canonicalJson(o[k])).join(',')+'}';
+}
+// 离线 HMAC-SHA256（演示环境委员密钥为 demo-key-{member_id}，与 /api/sign 同源）
+async function hmacHex(key,msg){
+  const enc=new TextEncoder();
+  const ck=await crypto.subtle.importKey('raw',enc.encode(key),{name:'HMAC',hash:'SHA-256'},false,['sign']);
+  const sig=await crypto.subtle.sign('HMAC',ck,enc.encode(msg));
+  return [...new Uint8Array(sig)].map(b=>b.toString(16).padStart(2,'0')).join('');
+}
+// 合并本地待提交草稿与服务端队列（终态以服务端为准）
+function mergedDrafts(){
+  const local=loadDrafts(), server=(S&&S.drafts)||[], byId={};
+  let changed=false;
+  for(const d of local) byId[d.draft_id]=d;
+  for(const sd of server){
+    const cur=byId[sd.draft_id];
+    if(cur){ if(cur.status!==sd.status){ Object.assign(cur,{status:sd.status,vote_id:sd.vote_id,conflict:sd.conflict}); changed=true; } }
+    else byId[sd.draft_id]=Object.assign({member_name:((S.committee.find(m=>m.member_id===sd.member_id)||{}).name)||sd.member_id,remote:true},sd);
+  }
+  if(changed) saveDrafts(local);
+  return Object.values(byId).filter(d=>d.cohort_id===CID)
+    .sort((a,b)=>String(a.created_at).localeCompare(String(b.created_at)));
+}
+
+function renderLeft(){
+  let h = `<h2>试验 / 队列</h2>`;
+  if(!S.trials.length){
+    h += `<div class="row"><input id="nt" placeholder="试验名称"></div>
+      <button onclick="newTrial()">新建试验</button>`;
+  }
+  for(const t of S.trials){
+    h += `<div class="small" style="margin-top:8px"><b>${esc(t.title)}</b> <span class="mut">${t.trial_id}</span></div>`;
+  }
+  for(const c of S.cohorts){
+    const active=c.subjects.filter(s=>!s.revision_removed).length;
+    const holds=S.holds.filter(x=>x.status==='active'&&(x.cohort_id===c.cohort_id||x.trial_id===c.trial_id)).length;
+    h += `<div class="item ${CID===c.cohort_id?'sel':''}" onclick="CID='${c.cohort_id}';SID=null;load()">
+      <b>${c.cohort_id}</b> ${statusTag(c.status)}
+      ${holds?'<span class="tag t-bad">⛔ 暂停中</span>':''}
+      <div class="mut small">剂量水平 ${c.level} · ${c.dose}${c.dose_unit} · 受试者 ${active}/${c.planned_n} · 窗 ${c.window_days}天 · rev${c.revision}</div>
+    </div>`;
+  }
+  if(S.trials.length){
+    h += `<details><summary class="mut" style="cursor:pointer;margin-top:8px">+ 新建队列</summary>
+      <div class="row"><select id="ct">${S.trials.map(t=>`<option value="${t.trial_id}">${esc(t.title)}</option>`).join('')}</select></div>
+      <div class="grid2">
+        <input id="cl" placeholder="剂量水平(整数)" value="1"><input id="cd" placeholder="剂量" value="10">
+        <input id="cu" placeholder="单位" value="mg"><input id="cn" placeholder="计划人数" value="3">
+        <input id="cw" placeholder="观察窗(天)" value="21">
+      </div>
+      <div class="row"><button onclick="newCohort()">创建队列</button></div></details>`;
+  }
+  h += `<h2 style="margin-top:14px">生效暂停</h2>`;
+  const ah=S.holds.filter(x=>x.status==='active');
+  h += ah.length? ah.map(x=>`<div class="item"><b>⛔ ${x.id}</b><div class="small">${esc(x.reason)}</div>
+        <button class="ok" onclick="releaseHold('${x.id}')">委员决定 continue 解除走右栏；如紧急放行填写原因</button>
+        <button class="ghost" onclick="releaseHold('${x.id}')">记录原因解除</button></div>`).join('')
+    : `<div class="mut small">无</div>`;
+  document.getElementById('left').innerHTML=h;
+}
+async function newTrial(){ const v=document.getElementById('nt').value.trim(); if(v) await act('新建试验',()=>api('POST','/api/trials',{title:v})); }
+async function newCohort(){
+  await act('创建队列',()=>api('POST','/api/cohorts',{
+    trial_id:document.getElementById('ct').value, level:+document.getElementById('cl').value,
+    dose:+document.getElementById('cd').value, dose_unit:document.getElementById('cu').value,
+    planned_n:+document.getElementById('cn').value, window_days:+document.getElementById('cw').value}));
+}
+async function releaseHold(id){
+  const reason=prompt('解除暂停的复核原因：'); if(reason) await act('解除暂停',()=>api('POST',`/api/holds/${id}/release`,{reason}));
+}
+
+function renderCenter(){
+  const el=document.getElementById('center');
+  if(!CID){ el.innerHTML='<h2>安全工作台</h2><p class="mut">选择一个队列。</p>'; return; }
+  const c=S.cohorts.find(x=>x.cohort_id===CID); if(!c) return;
+  const holds=S.holds.filter(x=>x.status==='active'&&(x.cohort_id===CID||x.trial_id===c.trial_id));
+  let h=`<h2>队列 ${c.cohort_id} ${statusTag(c.status)}</h2>
+    <div class="mut small">冻结方案：水平${c.level} · ${c.dose}${esc(c.dose_unit)} · ${c.planned_n}人 · 观察窗 ${c.window_days} 天 · 受试者集合修订 rev${c.revision}${c.frozen_at?` · 冻结于 ${c.frozen_at.slice(0,16)}`:''}</div>`;
+  if(c.rationale) h+=`<div class="mut small">${esc(c.rationale)}</div>`;
+  if(holds.length) h+=`<div class="tag t-bad">⛔ 紧急暂停生效：${esc(holds[0].reason)}</div>`;
+
+  // 操作
+  if(c.status==='draft') h+=`<div class="row" style="margin-top:8px">
+      <button onclick="enroll()">入组 1 名受试者</button>
+      <button class="ok" onclick="freeze()">冻结队列（方案/窗/受试者集合）</button></div>`;
+  if(c.status==='active') h+=`<div class="row" style="margin-top:8px">
+      <button class="danger" onclick="hold('cohort')">🚨 紧急暂停（队列）</button>
+      <button class="danger" onclick="hold('trial')">🚨 紧急暂停（全试验）</button>
+      <button class="ok" onclick="snapshot()">构建决策快照（跑规则引擎+门控）</button></div>`;
+
+  // 受试者
+  h+=`<h2 style="margin-top:10px">受试者集合</h2><table><tr><th>编号</th><th>状态</th><th>rev</th><th>给药</th><th>DLT</th><th>操作</th></tr>`;
+  for(const s of c.subjects){
+    h+=`<tr><td class="mono">${s.id}</td>
+      <td><span class="tag t-${s.status==='evaluable'?'ok':'draft'}">${({enrolled:'已入组',evaluable:'可评估',replaced:'已替补'})[s.status]}</span></td>
+      <td>${s.revision_added}${s.revision_removed!=null?`→${s.revision_removed}`:''}</td>
+      <td>${s.dose_given?'✓ '+s.dose_at.slice(5,16):'—'}</td>
+      <td>${s.dlt?'<b style="color:var(--bad)">是</b>':'否'}</td>
+      <td>${s.dose_given&&!s.revision_removed&&c.status==='active'?`<button class="ghost" onclick="dose('${s.id}')">登记给药</button>`:''}
+          ${!s.revision_removed&&c.status==='active'?`<button class="ghost" onclick="replaceS('${s.id}')">替补</button>`:''}
+          ${s.replaced_reason?`<div class="mut small">${esc(s.replaced_reason)} → ${s.replaced_by}</div>`:''}</td></tr>`;
+  }
+  h+=`</table>`;
+
+  // 给药事实
+  h+=`<h2 style="margin-top:10px">给药事实（只追加，不可删除）</h2><table><tr><th>编号</th><th>受试者</th><th>时间</th><th>结果</th></tr>`;
+  for(const a of c.administrations)
+    h+=`<tr><td class="mono">${a.id}</td><td class="mono">${a.subject_id}</td><td>${a.given_at.slice(5,16)}</td>
+      <td>${a.held_back?'<span class="tag t-bad">被暂停阻断（已留痕）</span>':'<span class="tag t-ok">已给药</span>'}
+      ${a.reason?`<div class="mut small">${esc(a.reason)}</div>`:''}</td></tr>`;
+  if(!c.administrations.length) h+='<tr><td colspan="4" class="mut">尚无</td></tr>';
+  h+='</table>';
+
+  // AE
+  h+=`<h2 style="margin-top:10px">安全事件 AE</h2><table><tr><th>编号</th><th>受试者</th><th>术语</th><th>严重度</th><th>发生</th><th>裁定</th><th>操作</th></tr>`;
+  for(const a of c.adverse_events){
+    const adv=a.assessed? (a.counts_as_dlt?'<span class="tag t-bad">可评估·计DLT</span>':'<span class="tag t-ok">可评估·非DLT</span>')
+      :'<span class="tag t-warn">待裁定</span>';
+    h+=`<tr><td class="mono">${a.id}${a.late?' <span class="tag t-info">迟到</span>':''}</td>
+      <td class="mono">${a.subject_id.slice(-3)}</td><td>${esc(a.term)}</td>
+      <td>${a.severity}</td><td>${a.onset_at.slice(5,16)}</td><td>${adv}</td>
+      <td>${c.status==='active'&&!a.assessed?`<button class="ghost" onclick="adj('${a.id}',true,false)">非DLT</button>
+        <button class="ghost" onclick="adj('${a.id}',true,true)">计DLT</button>
+        <button class="ghost" onclick="adj('${a.id}',false,false)">不可评估</button>`:esc(a.assess_note||'')}</td></tr>`;
+  }
+  h+=`</table>`;
+  if(c.status==='active') h+=`<div class="row"><input id="aet" placeholder="AE 术语" style="width:150px">
+      <select id="aeg">${Object.keys({grade1:1,grade2:2,grade3:3,grade4:4,grade5:5}).map(g=>`<option>${g}</option>`).join('')}</select>
+      <input id="aes" placeholder="受试者" style="width:120px" value="${(c.subjects.find(s=>!s.revision_removed)||{}).id||''}">
+      <input id="aeo" value="${S.now}" style="width:210px">
+      <button onclick="reportAE()">上报 AE</button></div>`;
+
+  // 缺失数据
+  h+=`<h2 style="margin-top:10px">缺失数据</h2>`;
+  for(const p of c.pending_data){
+    h+=`<div class="item"><b>${p.kind}</b> <span class="tag t-${p.status==='open'?'warn':'ok'}">${({open:'待处理',resolved:'已补获',imputed:'已缺失处理'})[p.status]}</span>
+      <div class="small">${esc(p.note)} ${p.subject_id?'· '+p.subject_id:''}</div>
+      ${p.status==='open'?`<div class="row"><input id="pr${p.id}" placeholder="处理说明（补获结果/插补依据）" style="flex:1">
+        <button class="ghost" onclick="resolveP('${p.id}',false)">标记补获</button>
+        <button class="ghost" onclick="resolveP('${p.id}',true)">按缺失处理(插补)</button></div>`
+      :`<div class="mut small">${esc(p.resolution)}</div>`}</div>`;
+  }
+  if(c.status==='active') h+=`<div class="row">
+      <select id="pk"><option>lab</option><option>followup</option><option>ae_assessment</option><option>other</option></select>
+      <input id="pn" placeholder="缺失说明" style="flex:1">
+      <button onclick="addP()">登记缺失数据</button></div>`;
+
+  // 断网投票草稿队列：待提交（本地）/ 已提交 / 过期（含服务端冲突原因）
+  h+=`<h2 style="margin-top:10px">断网投票草稿</h2>`;
+  const ds=mergedDrafts();
+  if(!ds.length) h+='<div class="mut small">无草稿。断网时在右侧快照详情点「存为断网草稿」，网络恢复后在此核对并提交。</div>';
+  for(const d of ds){
+    const tag=d.status==='submitted'?'<span class="tag t-ok">已提交</span>'
+      :d.status==='expired'?'<span class="tag t-bad">过期</span>'
+      :'<span class="tag t-warn">待提交</span>';
+    h+=`<div class="item"><b>${esc(d.member_name||d.member_id)}</b> → <span class="tag t-info">${d.action}</span> ${tag}
+      <div class="mut small">快照 ${esc(d.snapshot_id)} · 指纹 ${String(d.content_hash).slice(0,12)}… · ${String(d.created_at||'').slice(5,16)}${d.remote?' · 来自服务端队列':''}</div>`;
+    if(d.status==='expired'&&d.conflict)
+      h+=`<div class="small" style="color:var(--bad)">⛔ ${esc(d.conflict.message)} <span class="mono">[${esc(d.conflict.code)}]</span></div>`;
+    if(d.status==='submitted')
+      h+=`<div class="mut small">✓ 已产生 1 张票 ${esc(d.vote_id||'')}（重复提交只返回首次结果，不会产生第二张票）</div>`;
+    h+=`<div class="row">`;
+    if(d.status==='pending')
+      h+=`<button onclick="submitDraft('${d.draft_id}')">核对快照并提交</button>
+          <button class="ghost" onclick="dropDraft('${d.draft_id}')">删除</button>`;
+    else
+      h+=`<button class="ghost" onclick="replayDraft('${d.draft_id}')">查看首次结果（幂等）</button>`;
+    h+=`</div></div>`;
+  }
+  const pendN=ds.filter(d=>d.status==='pending').length;
+  if(pendN>1) h+=`<div class="row"><button onclick="submitAllDrafts()">全部提交（${pendN} 份待提交）</button></div>`;
+  el.innerHTML=h;
+}
+
+async function enroll(){await act('入组',()=>api('POST',`/api/cohorts/${CID}/enroll`,{cohort_id:CID}))}
+async function freeze(){await act('冻结',()=>api('POST',`/api/cohorts/${CID}/freeze`,{cohort_id:CID}))}
+async function dose(sid){await act('登记给药',()=>api('POST',`/api/cohorts/${CID}/administrations`,{cohort_id:CID,subject_id:sid}))}
+async function hold(scope){const reason=prompt('紧急暂停原因（立即阻断后续给药）：'); if(reason) await act('紧急暂停',()=>api('POST',`/api/cohorts/${CID}/holds`,{cohort_id:CID,trial_id:S.cohorts.find(c=>c.cohort_id===CID).trial_id,scope,reason}))}
+async function reportAE(){
+  await act('上报AE',()=>api('POST',`/api/cohorts/${CID}/aes`,{cohort_id:CID,
+    subject_id:document.getElementById('aes').value, term:document.getElementById('aet').value,
+    severity:document.getElementById('aeg').value, onset_at:document.getElementById('aeo').value}));
+}
+async function adj(id,ev,dlt){const note=prompt('裁定备注：')||'';await act('AE裁定',()=>api('POST',`/api/aes/${id}/adjudicate`,{evaluable:ev,counts_as_dlt:dlt,note}))}
+async function replaceS(sid){const reason=prompt('替补原因（如：失访/非剂量相关退出）：');if(reason) await act('受试者替补',()=>api('POST',`/api/subjects/${sid}/replace`,{cohort_id:CID,reason}))}
+async function addP(){await act('登记缺失',()=>api('POST',`/api/cohorts/${CID}/pending`,{cohort_id:CID,kind:document.getElementById('pk').value,note:document.getElementById('pn').value}))}
+async function resolveP(id,imp){await act('处理缺失',()=>api('POST',`/api/pending/${id}/resolve`,{resolution:document.getElementById('pr'+id).value,imputed:imp}))}
+async function snapshot(){const r=await act('构建快照',()=>api('POST',`/api/cohorts/${CID}/snapshots`,{cohort_id:CID})); if(r) SID=r.snapshot_id}
+
+// ---------------- 右栏：快照、投票、证明 ----------------
+async function loadSnap(id){ SID=id; await load(); }
+function renderRight(){
+  const el=document.getElementById('right');
+  let h='<h2>规则版本</h2>';
+  for(const r of S.rulesets) h+=`<div class="item ${r.active?'sel':''}"><b>v${r.version}</b> ${r.active?'<span class="tag t-ok">生效中</span>':''}
+    <div class="mut small">DLT 门槛 ≥ ${r.spec.min_severity_dlt} · 区间 ${r.spec.bands.map(b=>b.action).join('/')}</div>
+    <div class="mut small">${esc(r.note||'')}</div></div>`;
+  h+=`<details><summary class="mut" style="cursor:pointer">+ 发布修订版本（不影响旧快照）</summary>
+    <textarea id="rspec" rows="6">${JSON.stringify({min_severity_dlt:'grade3',bands:[{max_dlt:0,action:'escalate'},{max_dlt:1,action:'expand'},{max_dlt:null,action:'stop'}]},null,1)}</textarea>
+    <input id="rnote" placeholder="修订说明"><button onclick="pubRule()">发布</button></details>`;
+
+  h+='<h2 style="margin-top:10px">本队列快照</h2>';
+  const snaps=S.snapshots.filter(x=>x.cohort_id===CID);
+  if(!snaps.length) h+='<div class="mut small">尚无快照</div>';
+  for(const s of snaps){
+    h+=`<div class="item ${SID===s.snapshot_id?'sel':''}" onclick="loadSnap('${s.snapshot_id}')">
+      <b>${s.snapshot_id}</b> ${s.superseded?'<span class="sup">已失效</span>':'<span class="fresh">有效</span>'}
+      <div class="mut small">规则 v${s.ruleset_version} · hash ${s.content_hash}… · ${s.created_at.slice(5,16)}</div></div>`;
+  }
+  if(SID) h+=renderSnapshotDetail();
+  h+='<h2 style="margin-top:10px">已签发决定</h2>';
+  for(const d of S.decisions.filter(x=>x.cohort_id===CID)){
+    h+=`<div class="item"><b>${d.id}</b> <span class="tag t-info">${d.action}</span>
+      <div class="mut small">引擎=${d.outcome} · 快照 ${d.snapshot_id}${d.child_cohort_id?' · 派生 '+d.child_cohort_id:''}</div>
+      <button class="ghost" onclick="showProof('${d.id}')">查看决策证明</button>
+      <button class="ok" onclick="verifyProof('${d.id}')">独立校验证明</button></div>`;
+  }
+  if(DID){ const d=S.decisions.find(x=>x.id===DID); }
+  el.innerHTML=h;
+}
+
+async function pubRule(){
+  try{ const spec=JSON.parse(document.getElementById('rspec').value);
+    await act('发布规则',()=>api('POST','/api/rules',{spec,note:document.getElementById('rnote').value}));
+  }catch(e){ if(e.message) toast('规则 JSON 解析失败',true); else await Promise.resolve(); }
+}
+
+async function getSnap(){ return await api('GET',`/api/snapshots/${SID}`); }
+function renderSnapshotDetail(){
+  // 详细内容在点击后异步取（避免 state 过大），这里放容器
+  window.__snapDetailRequested = window.__snapDetailRequested || {};
+  return `<div id="snapDetail" class="item"><div class="mut">加载中…</div></div>`;
+}
+
+async function refreshSnapDetail(){
+  const box=document.getElementById('snapDetail'); if(!box) return;
+  let sp; try{ sp=await getSnap(); }catch(e){ box.innerHTML='<span class="sup">'+esc(e.message)+'</span>'; return; }
+  window.__lastSnap=sp;
+  const g=sp.gates, oc=sp.outcome;
+  const gateNames={window_complete:'观察窗完整',missing_data_resolved:'缺失数据已处理',
+    events_adjudicated:'安全事件全部裁定',evaluable_set_complete:'可评估受试者集合完整',
+    independent_quorum_available:'独立委员达到门槛'};
+  let h=`<b>${sp.snapshot_id}</b> ${sp.superseded?'<span class="sup">⛔ 已失效（出现迟到事件/替补，必须重建）</span>':sp.stale_by_new_material?'<span class="sup">⛔ 检测到新实质事件</span>':'<span class="fresh">✓ 锚定有效</span>'}
+    <div class="mut small">受试者 rev${sp.revision} · 规则 v${sp.ruleset_version} · material_seq=${sp.material_seq}</div>
+    <div class="mono small">content_hash=${sp.content_hash.slice(0,32)}…</div>`;
+  for(const[k,v]of Object.entries(gates0(g))){
+    h+=`<div class="gate"><span class="dot ${v.passed?'on':'off'}"></span><div><b>${gateNames[k]||k}</b> ${v.passed?'✓':'<span class="sup">未通过</span>'}`;
+    if(!v.passed&&v.blockers?.length) h+=`<div class="mut small">${v.blockers.map(b=>esc(b.reason||JSON.stringify(b))).join('；')}</div>`;
+    h+='</div></div>';
+  }
+  h+=`<div style="margin:6px 0">规则引擎：<span class="tag t-${oc.recommendation==='stop'?'bad':oc.recommendation==='expand'?'warn':'ok'}">${oc.recommendation.toUpperCase()}</span>
+    <span class="mut small">DLT ${oc.dlt_count}/${oc.evaluable_n} 可评估 · ${esc(oc.band_label)}</span></div>
+    <div class="mut small">投票版本 vote_version=${sp.vote_version}（并发投票须带 expected_version）</div>`;
+  // 委员投票
+  h+='<table><tr><th>委员</th><th>角色</th><th>动作</th></tr>';
+  for(const v of sp.votes){
+    const m=S.committee.find(x=>x.member_id===v.member_id)||{};
+    h+=`<tr><td>${esc(m.name||v.member_id)}</td><td>${v.member_id.includes('SPO')?'申办方':'独立'}</td><td>${v.action}</td></tr>`;
+  }
+  h+='</table>';
+  const disabled=sp.superseded||sp.stale_by_new_material||!g.ready;
+  h+=`<div class="row"><select id="vm">${S.committee.filter(m=>m.active).map(m=>`<option value="${m.member_id}">${esc(m.name)}（${m.role==='independent'?'独立':'申办方'}）</option>`).join('')}</select>
+    <select id="va"><option>escalate</option><option>expand</option><option>stop</option><option>continue</option></select>
+    <button ${disabled?'disabled':''} onclick="vote(${sp.vote_version})">签名投票（expected_version=${sp.vote_version}）</button></div>
+    <button class="ok" ${disabled?'disabled':''} onclick="decide()">核验门槛并签发决定（生成决策证明）</button>
+    <button class="ghost" ${disabled?'disabled':''} onclick="saveDraft()">💾 存为断网草稿（本地签名，恢复后提交）</button>`;
+  if(!g.ready) h+='<div class="mut small">五道安全门未全部通过，投票/签发已禁用。</div>';
+  box.innerHTML=h;
+}
+function gates0(g){const o={};for(const[k,v]of Object.entries(g))if(k!=='ready')o[k]=v;return o}
+async function vote(expected){
+  const member=document.getElementById('vm').value, action=document.getElementById('va').value;
+  try{
+    const sp=await getSnap();
+    const sig=await api('POST','/api/sign',{member_id:member,snapshot_id:SID,content_hash:sp.content_hash,action});
+    await act('投票',()=>api('POST',`/api/snapshots/${SID}/votes`,{member_id:member,action,signature:sig.signature,expected_version:expected}));
+    setTimeout(refreshSnapDetail,250);
+  }catch(e){
+    if(e.code==='offline'){ toast('当前断网：实时投票不可用，请改用「存为断网草稿」',true); return; }
+    toast('投票失败：'+e.message+(e.code==='snapshot_version_conflict'?'（并发冲突：请刷新快照后用新版本号重试）':''),true); await load(); setTimeout(refreshSnapDetail,250);
+  }
+}
+async function decide(){
+  try{ const d=await api('POST',`/api/snapshots/${SID}/decisions`,{});
+    DID=d.decision_id; toast('决定已签发：'+d.action); await load(); showProof(DID);
+  }catch(e){ toast('签发失败：'+e.message,true); await load(); setTimeout(refreshSnapDetail,250);}
+}
+async function showProof(id){
+  DID=id;
+  const d=await api('GET',`/api/decisions/${id}`);
+  const el=document.getElementById('right');
+  const p=d.proof_bundle;
+  el.innerHTML=`<h2>决策证明 ${id}</h2>
+    <div class="row"><button class="ghost" onclick="load();${SID?`setTimeout(refreshSnapDetail,100)`:''}">← 返回</button>
+      <button class="ok" onclick="verifyProof('${id}')">独立校验</button>
+      <button class="danger" onclick="tamperProof('${id}')">演练：篡改后校验</button></div>
+    <div class="small"><b>动作：</b><span class="tag t-info">${p.action}</span> 于 ${p.issued_at.slice(5,16)} 由 ${esc(p.issued_by)}</div>
+    <div class="small"><b>快照：</b>${p.snapshot_id} · 规则 v${p.rule_engine.ruleset_version} · 引擎=${p.rule_engine.recommendation}（DLT ${p.rule_engine.dlt_count}/${p.rule_engine.evaluable_n}）</div>
+    <div class="small"><b>门槛：</b>${p.quorum.cast}/${p.quorum.required} 票，独立 ${p.quorum.independent_cast}/${p.quorum.independent_required}</div>
+    <div class="small"><b>五门：</b>${Object.entries(p.gates).filter(([k])=>k!=='ready').map(([k,v])=>`${v.passed?'✅':'❌'}`).join(' ')}</div>
+    <div class="mono small">proof_hash=${p.proof_hash.slice(0,32)}…</div>
+    <h2>证明载荷</h2><pre>${esc(JSON.stringify(p,null,1))}</pre>`;
+}
+async function verifyProof(id){
+  const r=await api('GET',`/api/decisions/${id}/verify`);
+  toast((r.verified?'✅ 证明全部校验通过':'⛔ 校验失败')+'（'+r.checks.filter(c=>c.passed).length+'/'+r.checks.length+' 项）', !r.verified);
+  let detail=r.checks.map(c=>`${c.passed?'✅':'❌'} ${c.check} ${c.detail?'· '+c.detail:''}`).join('\n');
+  const box=document.createElement('div');
+  setTimeout(()=>{
+    const el=document.getElementById('right');
+    el.insertAdjacentHTML('afterbegin',`<div class="item"><b>校验报告</b><pre>${esc(detail)}</pre></div>`);
+  }, 50);
+}
+async function tamperProof(id){
+  // 演练：取库内证明 → 改掉动作字段 → 连同篡改件送独立校验端点
+  const d=await api('GET',`/api/decisions/${id}`);
+  const tampered=JSON.parse(JSON.stringify(d.proof_bundle));
+  tampered.action = tampered.action==='stop'?'escalate':'stop';
+  const r=await api('POST',`/api/decisions/${id}/verify`,{proof:tampered});
+  toast(`篡改演练：verified=${r.verified}，${r.checks.filter(c=>c.passed).length}/${r.checks.length} 项通过`, true);
+  const el=document.getElementById('right');
+  el.insertAdjacentHTML('afterbegin',`<div class="item"><b>篡改件校验报告</b>
+    <pre>${esc(r.checks.map(c=>(c.passed?'✅':'❌')+' '+c.check).join('\n'))}</pre></div>`);
+}
+
+// ---------------- 断网草稿动作 ----------------
+async function saveDraft(){
+  const sp=window.__lastSnap;
+  if(!sp||sp.snapshot_id!==SID){ toast('快照详情未加载，无法存草稿',true); return; }
+  if(sp.superseded||sp.stale_by_new_material){ toast('快照已失效，不能存草稿',true); return; }
+  if(!sp.gates.ready){ toast('五道安全门未全过，草稿不会通过服务端核对',true); return; }
+  const member=document.getElementById('vm').value, action=document.getElementById('va').value;
+  const payload={snapshot_id:sp.snapshot_id,content_hash:sp.content_hash,action,member_id:member};
+  let sig;
+  try{ sig=await hmacHex('demo-key-'+member, canonicalJson(payload)); }
+  catch(e){ toast('本地签名失败（需 localhost/HTTPS 环境）：'+e.message,true); return; }
+  const drafts=loadDrafts();
+  const m=S.committee.find(x=>x.member_id===member);
+  drafts.push({draft_id:uid(),snapshot_id:sp.snapshot_id,cohort_id:sp.cohort_id,
+    member_id:member,member_name:m?m.name:member,action,content_hash:sp.content_hash,
+    signature:sig,expected_version:sp.vote_version,
+    created_at:new Date().toISOString(),status:'pending'});
+  saveDrafts(drafts);
+  toast('草稿已保存到本地（断网安全）：'+action+' @ '+sp.snapshot_id);
+  renderCenter();
+}
+async function submitDraft(id){
+  const drafts=loadDrafts(), d=drafts.find(x=>x.draft_id===id);
+  if(!d){ toast('草稿不在本地，以服务端队列为准'); await load(); return; }
+  if(d.status!=='pending'){ await replayDraft(id); return; }
+  if(OFFLINE){ toast('仍在断网：草稿保持「待提交」',true); return; }
+  // 1) 先核对快照仍然有效（迟到事件/替补/规则换版都会使草稿过期）
+  let sp=null;
+  try{ sp=await api('GET',`/api/snapshots/${d.snapshot_id}`); }
+  catch(e){ if(e.code==='offline'){ toast('网络未恢复，稍后再试',true); return; } }
+  if(sp){
+    const active=(S.rulesets.filter(r=>r.active)[0]||{}).version;
+    const bad=[];
+    if(sp.content_hash!==d.content_hash) bad.push('快照指纹不一致');
+    if(sp.superseded||sp.stale_by_new_material) bad.push('快照已被迟到事件/替补推进');
+    if(active&&sp.ruleset_version!==active) bad.push(`规则已换版 v${sp.ruleset_version}→v${active}`);
+    if(bad.length) toast('核对未通过：'+bad.join('；')+' → 提交服务端登记为「过期」',true);
+    d.expected_version=sp.vote_version;
+  }
+  // 2) 一次性提交：服务端权威核对 + 幂等（同一 draft_id 只产生一次结果）
+  try{
+    const r=await api('POST','/api/drafts',{draft_id:d.draft_id,snapshot_id:d.snapshot_id,
+      member_id:d.member_id,action:d.action,content_hash:d.content_hash,
+      signature:d.signature,expected_version:d.expected_version});
+    Object.assign(d,{status:r.draft.status,vote_id:r.draft.vote_id});
+    toast(r.replayed?'幂等回放：该草稿此前已提交，未产生第二张票':'草稿已提交：产生 1 张票 '+r.draft.vote_id);
+  }catch(e){
+    const dr=e.body&&e.body.draft;
+    if(dr&&dr.status==='expired'){
+      Object.assign(d,{status:'expired',conflict:dr.conflict});
+      toast('草稿已过期并阻止写入：'+(dr.conflict?dr.conflict.message:e.message),true);
+    }else if(e.code==='snapshot_version_conflict'||e.code==='hold_active'){
+      toast('暂缓：'+e.message+'（草稿保持待提交，可重试）',true);
+    }else if(e.code==='offline'){ toast('网络未恢复',true); return; }
+    else toast('提交失败：'+e.message,true);
+  }
+  saveDrafts(drafts); await load();
+}
+async function submitAllDrafts(){
+  for(const d of loadDrafts().filter(x=>x.status==='pending'&&x.cohort_id===CID))
+    await submitDraft(d.draft_id);
+}
+async function replayDraft(id){
+  const d=mergedDrafts().find(x=>x.draft_id===id); if(!d) return;
+  const local=loadDrafts().find(x=>x.draft_id===id);
+  const sig=(local&&local.signature)||d.signature;
+  if(OFFLINE||!sig){
+    toast('首次结果：'+(d.status==='submitted'?('已提交，票 '+d.vote_id)
+      :('过期 ['+(d.conflict&&d.conflict.code)+'] '+(d.conflict&&d.conflict.message))),d.status!=='submitted');
+    return;
+  }
+  // 重复提交同一 draft_id：服务端幂等回放首次结果，绝不产生第二张票
+  try{
+    const r=await api('POST','/api/drafts',{draft_id:d.draft_id,snapshot_id:d.snapshot_id,
+      member_id:d.member_id,action:d.action,content_hash:d.content_hash,
+      signature:sig,expected_version:d.expected_version||0});
+    toast('首次结果回放：已提交，票 '+r.draft.vote_id+'（未产生第二张票）');
+  }catch(e){
+    const dr=e.body&&e.body.draft;
+    if(dr) toast('首次结果回放：过期 ['+dr.conflict.code+'] '+dr.conflict.message,true);
+    else toast('回放失败：'+e.message,true);
+  }
+  await load();
+}
+function dropDraft(id){
+  saveDrafts(loadDrafts().filter(x=>!(x.draft_id===id&&x.status==='pending')));
+  renderCenter();
+}
+
+load();
+setInterval(()=>{ if(!OFFLINE&&SID&&document.getElementById('snapDetail')&&!DID) refreshSnapDetail(); }, 8000);
+</script>
+</body>
+</html>
