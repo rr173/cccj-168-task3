@@ -9,6 +9,7 @@ import json
 import os
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import parse_qs, urlparse
 
 from .crypto import canonical_json, hmac_hex
 from .errors import DomainError
@@ -41,6 +42,24 @@ def build_server(db_path: str, host: str = "127.0.0.1", port: int = 8080):
             self.end_headers()
             self.wfile.write(body)
 
+        def _send_download(self, obj, filename: str):
+            body = json.dumps(obj, ensure_ascii=False, indent=2).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Disposition",
+                             f'attachment; filename="{filename}"')
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def _auditor(self, data: dict | None = None):
+            """稽核员身份：优先请求头，其次请求体字段（演示便利）。"""
+            aid = self.headers.get("X-Auditor-Id")
+            tok = self.headers.get("X-Auditor-Token")
+            if not aid and data:
+                aid, tok = data.get("auditor_id"), data.get("auditor_token")
+            return aid, tok
+
         def _file(self, path: str):
             full = os.path.normpath(os.path.join(WEB_DIR, path.lstrip("/")))
             if not full.startswith(WEB_DIR) or not os.path.isfile(full):
@@ -56,12 +75,29 @@ def build_server(db_path: str, host: str = "127.0.0.1", port: int = 8080):
             self.wfile.write(body)
 
         def do_GET(self):
-            path = self.path.split("?")[0]
+            parsed = urlparse(self.path)
+            path = parsed.path
             try:
                 if path == "/api/state":
                     self._send(svc.get_state())
                 elif path == "/api/drafts":
                     self._send({"drafts": svc.list_vote_drafts()})
+                elif path == "/api/archives":
+                    aid, tok = self._auditor()
+                    svc._require_auditor(aid, tok)
+                    q = parse_qs(parsed.query)
+                    self._send({"archives": svc.list_archives(
+                        decision_id=(q.get("decision_id") or [None])[0],
+                        cohort_id=(q.get("cohort_id") or [None])[0])})
+                elif path.startswith("/api/archives/"):
+                    aid, tok = self._auditor()
+                    svc._require_auditor(aid, tok)
+                    parts = path.split("/")
+                    if len(parts) == 5 and parts[4] == "download":
+                        bundle = svc.get_archive_bundle(aid, tok, parts[3])
+                        self._send_download(bundle, f"archive-{parts[3]}.json")
+                    else:
+                        self._send(svc.get_archive(parts[3]))
                 elif path.startswith("/api/cohorts/"):
                     parts = path.split("/")
                     if len(parts) == 5 and parts[4] == "drafts":
@@ -159,6 +195,19 @@ def build_server(db_path: str, host: str = "127.0.0.1", port: int = 8080):
                 self._send(s.cast_vote(
                     actor, path.split("/")[3], d["member_id"], d["action"],
                     d["signature"], int(d["expected_version"])), 201)
+            elif path == "/api/archives":
+                # 发起归档（幂等）：相同决定+相同策略的并发/重复请求只生成一份
+                aid, tok = self._auditor(d)
+                view = s.request_archive(
+                    aid, tok, d["decision_id"], d.get("policy", "full"),
+                    d.get("cover_through_seq"))
+                if view["status"] in ("queued", "generating"):
+                    view = s.drive_archive(view["archive_id"])
+                self._send(view, 200 if view.get("replayed") else 201)
+            elif path == "/api/archives/verify":
+                # 独立验真下载的归档包
+                aid, tok = self._auditor(d)
+                self._send(s.verify_archive_bundle(aid, tok, d.get("bundle")))
             elif path == "/api/drafts":
                 # 断网草稿一次性提交（幂等）：过期返回 409 + 冲突原因与草稿记录
                 view = s.submit_vote_draft(

@@ -14,7 +14,9 @@
 """
 from __future__ import annotations
 
+import hmac
 import json
+import sqlite3
 import threading
 import uuid
 from datetime import timedelta
@@ -22,14 +24,19 @@ from datetime import timedelta
 from . import rules
 from .clock import now_utc, now_iso, parse_iso, set_clock
 from .crypto import canonical_json, canonical_hash, verify_hmac
-from .errors import Conflict, DomainError, NotFound, ValidationFailed
-from .store import MATERIAL_EVENT_TYPES, append_event, verify_chain
+from .errors import Conflict, DomainError, Forbidden, NotFound, ValidationFailed
+from .store import (ARCHIVE_EVENT_TYPES, GENESIS_HASH, MATERIAL_EVENT_TYPES,
+                    append_event, verify_chain)
 
 # 委员会门槛：至少 2 票，且其中至少 2 票来自独立安全委员
 QUORUM = 2
 REQUIRED_INDEPENDENT = 2
 
 VALID_GRADES = set(rules.SEVERITY_ORDER)
+
+# 归档导出策略：full=完整包（含日志载荷）；redacted=精简包（隐去日志操作人/载荷、
+# 委员姓名）。两种策略都绝不包含委员 HMAC 密钥与稽核员令牌。
+ARCHIVE_POLICIES = ("full", "redacted")
 
 
 def _uid(prefix: str) -> str:
@@ -41,10 +48,14 @@ def _json_dumps(obj) -> str:
 
 
 class Services:
-    def __init__(self, conn):
+    def __init__(self, conn, archive_chunk_size: int = 50):
         self.conn = conn
         # 同一连接被多线程直接使用时（HTTP 层另有写锁），保证 CAS 检查-写入原子性
         self._lock = threading.RLock()
+        # 归档生成每次调用处理的日志块大小（测试可注入小值以模拟中断/续跑）
+        self._archive_chunk_size = archive_chunk_size
+        # 测试专用故障注入钩子：在归档生成的每个块前调用，用于模拟生成中断
+        self._archive_fault_hook = None
 
     # ------------------------------------------------------------------ 引导
     def bootstrap(self) -> dict:
@@ -70,6 +81,13 @@ class Services:
         if self.conn.execute("SELECT COUNT(*) c FROM rulesets").fetchone()["c"] == 0:
             self._publish_ruleset(rules.DEFAULT_SPEC, "system",
                                   "首版规则：≥3 级可评估 AE 计 DLT，标准 3+3 区间", created=False)
+        if self.conn.execute("SELECT COUNT(*) c FROM auditors").fetchone()["c"] == 0:
+            self.conn.execute(
+                "INSERT INTO auditors(auditor_id,name,token) VALUES(?,?,?)",
+                ("AUD-01", "监管稽核员（演示）", "demo-audit-token"))
+            append_event(self.conn, "auditor_seeded", "system",
+                         {"auditors": [{"auditor_id": "AUD-01"}]})
+            created.append({"auditor_id": "AUD-01", "token": "demo-audit-token"})
         self.conn.commit()
         return {"members": created}
 
@@ -1203,6 +1221,484 @@ class Services:
                 "verified": all(c["passed"] for c in checks),
                 "checks": checks}
 
+    # ------------------------------------------------------------- 监管稽核归档
+    # 获授权的稽核员针对已签发的队列决定发起归档：系统在请求时刻固定
+    # 决定证明、相关日志区间 [journal_from, journal_to] 与委员角色信息，
+    # 脱敏（绝不包含委员 HMAC 密钥/稽核员令牌；redacted 策略额外隐去日志
+    # 操作人/载荷与委员姓名）后生成可下载、可独立验真的包。
+    #
+    # 关键不变量
+    #   1. 幂等去重：dedup_key = 决定|策略|固定日志头，UNIQUE 约束保证相同
+    #      决定+相同导出策略的并发请求只生成一份结果（后到者回放首份）。
+    #   2. 断点续跑：生成按块推进并逐块落盘（archive_events），中断后从
+    #      progress_seq 继续；所有读取都带 seq<=journal_to 上界，恢复后
+    #      绝不混入归档发起之后到达的日志。
+    #   3. 旧包不改写：后续新安全事实使既有归档显示「有新事件」提示，
+    #      稽核员可发起覆盖新区间的新归档；新归档就绪后旧归档标记为
+    #      superseded，但其包内容与哈希保持不变、仍可下载验真。
+    #   4. 归档系统自身的生命周期事件（archive_requested/ready/failed）进入
+    #      哈希链供审计，但不计入「业务日志头」，因此归档操作本身不会
+    #      推动归档区间，也不会影响给药、投票草稿与既有证明校验。
+    def _require_auditor(self, auditor_id: str | None, token: str | None):
+        """稽核员鉴权：无权限一律明确拒绝（403）。"""
+        if not auditor_id or not token:
+            raise Forbidden("需要稽核员身份：请提供 X-Auditor-Id / X-Auditor-Token")
+        row = self.conn.execute(
+            "SELECT * FROM auditors WHERE auditor_id=?", (auditor_id,)).fetchone()
+        if row is None or not row["active"]:
+            raise Forbidden(f"稽核员 {auditor_id} 未授权")
+        if not hmac.compare_digest(row["token"], token):
+            raise Forbidden("稽核员令牌无效")
+        return row
+
+    def _business_journal_head(self) -> int:
+        """业务日志头：归档系统自身事件不推动归档区间。"""
+        placeholders = ",".join("?" for _ in ARCHIVE_EVENT_TYPES)
+        row = self.conn.execute(
+            f"SELECT MAX(seq) m FROM journal WHERE event_type NOT IN ({placeholders})",
+            tuple(ARCHIVE_EVENT_TYPES)).fetchone()
+        return row["m"] or 0
+
+    def _proof_integrity_failures(self, decision_id: str) -> list:
+        """归档准入的证明完整性复核。
+
+        复用 11 项独立校验，但排除 snapshot_not_superseded_now：那是决策时刻的
+        新鲜度检查——决定签发后迟到的安全事实（如迟报 AE）会合法地使快照失效，
+        而归档固定的正是当时的历史事实，不应因此被拒。
+        """
+        try:
+            report = self.verify_proof(decision_id)
+        except Exception as e:  # noqa: BLE001 —— 证明无法解析即视为损坏
+            return [{"check": "proof_unreadable", "passed": False, "detail": str(e)}]
+        return [c for c in report["checks"]
+                if not c["passed"] and c["check"] != "snapshot_not_superseded_now"]
+
+    def request_archive(self, auditor_id: str, token: str, decision_id: str,
+                        policy: str, cover_through_seq: int | None = None) -> dict:
+        """发起归档（幂等）：相同决定+相同策略+相同日志头只生成一份。"""
+        auditor = self._require_auditor(auditor_id, token)
+        if policy not in ARCHIVE_POLICIES:
+            raise ValidationFailed(f"policy 必须是 {list(ARCHIVE_POLICIES)}")
+        d = self.conn.execute("SELECT * FROM decisions WHERE id=?",
+                              (decision_id,)).fetchone()
+        if d is None:
+            raise NotFound(f"决定 {decision_id}")
+        failures = self._proof_integrity_failures(decision_id)
+        if failures:
+            names = ",".join(c["check"] for c in failures)
+            raise Conflict("proof_corrupted",
+                           f"决策证明未通过完整性校验（{names}），拒绝归档；"
+                           "请先核查证明与日志链")
+        cohort_id = d["cohort_id"]
+        anchor = self.conn.execute(
+            "SELECT seq FROM journal WHERE cohort_id=? AND event_type='cohort_created'"
+            " ORDER BY seq LIMIT 1", (cohort_id,)).fetchone()
+        journal_from = anchor["seq"]
+        journal_to = self._business_journal_head()
+        if cover_through_seq is not None:
+            try:
+                cover_through_seq = int(cover_through_seq)
+            except (TypeError, ValueError):
+                raise ValidationFailed("cover_through_seq 必须是整数（日志序号）")
+        if cover_through_seq is not None and cover_through_seq != journal_to:
+            raise Conflict(
+                "archive_param_conflict",
+                f"请求参数冲突：指定的日志覆盖终点 {cover_through_seq} 与当前业务日志头 "
+                f"{journal_to} 不一致——期间已出现新事件，请刷新视图后重新发起")
+        dedup_key = f"{decision_id}|{policy}|{journal_to}"
+        with self._lock:
+            existing = self.conn.execute(
+                "SELECT * FROM archives WHERE dedup_key=?", (dedup_key,)).fetchone()
+            if existing is not None:
+                if existing["status"] == "failed":
+                    # 失败可重试：同一去重键复位重排队，不产生第二份归档
+                    with self.conn:
+                        self.conn.execute(
+                            "DELETE FROM archive_events WHERE archive_id=?",
+                            (existing["id"],))
+                        self.conn.execute(
+                            "UPDATE archives SET status='queued',error=NULL,"
+                            "progress_seq=?,attempt=attempt+1,updated_at=? WHERE id=?",
+                            (journal_from - 1, now_iso(self.conn), existing["id"]))
+                        append_event(self.conn, "archive_requested", auditor["auditor_id"], {
+                            "archive_id": existing["id"], "decision_id": decision_id,
+                            "cohort_id": cohort_id, "policy": policy,
+                            "journal_from": journal_from, "journal_to": journal_to,
+                            "retry_of_attempt": existing["attempt"]}, cohort_id)
+                    return self.get_archive(existing["id"], replayed=False)
+                # 并发/重复请求：回放首份结果（queued/generating 由调用方继续驱动）
+                return self.get_archive(existing["id"], replayed=True)
+            aid = _uid("AR")
+            ts = now_iso(self.conn)
+            try:
+                with self.conn:
+                    append_event(self.conn, "archive_requested", auditor["auditor_id"], {
+                        "archive_id": aid, "decision_id": decision_id,
+                        "cohort_id": cohort_id, "policy": policy,
+                        "journal_from": journal_from, "journal_to": journal_to,
+                        "dedup_key": dedup_key}, cohort_id)
+                    self.conn.execute(
+                        "INSERT INTO archives(id,decision_id,cohort_id,policy,status,"
+                        "dedup_key,journal_from,journal_to,progress_seq,requested_by,"
+                        "created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                        (aid, decision_id, cohort_id, policy, "queued", dedup_key,
+                         journal_from, journal_to, journal_from - 1,
+                         auditor["auditor_id"], ts, ts))
+            except sqlite3.IntegrityError:
+                # 服务锁之外的最终防线：唯一约束冲突 → 回放已存在的那份
+                row = self.conn.execute(
+                    "SELECT * FROM archives WHERE dedup_key=?", (dedup_key,)).fetchone()
+                return self.get_archive(row["id"], replayed=True)
+            return self.get_archive(aid, replayed=False)
+
+    def process_archive(self, archive_id: str, max_chunks: int | None = None) -> dict:
+        """按块推进归档生成；可在块边界中断，再次调用即断点续跑。
+
+        每个块一个事务：崩溃只回滚在途块，已落盘的块与 progress_seq 保持一致。
+        所有读取都带 seq<=journal_to 上界——即使恢复时日志已增长，也绝不混入
+        归档发起之后到达的事件。
+        """
+        with self._lock:
+            row = self._require_archive(archive_id)
+            if row["status"] not in ("queued", "generating"):
+                return self._archive_view(row)
+            try:
+                if row["status"] == "queued":
+                    with self.conn:
+                        self.conn.execute(
+                            "UPDATE archives SET status='generating',updated_at=?"
+                            " WHERE id=?", (now_iso(self.conn), archive_id))
+                processed = 0
+                while True:
+                    row = self._require_archive(archive_id)
+                    progress = row["progress_seq"]
+                    if progress >= row["journal_to"]:
+                        self._finalize_archive(row)
+                        break
+                    if max_chunks is not None and processed >= max_chunks:
+                        break  # 中断点：状态保持 generating，等待续跑
+                    if self._archive_fault_hook is not None:
+                        self._archive_fault_hook(processed)  # 测试注入：模拟生成中断
+                    chunk = self.conn.execute(
+                        "SELECT * FROM journal WHERE seq>? AND seq<=? ORDER BY seq LIMIT ?",
+                        (progress, row["journal_to"], self._archive_chunk_size)).fetchall()
+                    if not chunk:
+                        raise Conflict("journal_corrupted",
+                                       f"日志区间存在缺口（seq>{progress} 无记录），归档中止")
+                    with self.conn:
+                        for ev in chunk:
+                            self.conn.execute(
+                                "INSERT INTO archive_events(archive_id,seq,event_json)"
+                                " VALUES(?,?,?)",
+                                (archive_id, ev["seq"], _json_dumps(dict(ev))))
+                        self.conn.execute(
+                            "UPDATE archives SET progress_seq=?,updated_at=? WHERE id=?",
+                            (chunk[-1]["seq"], now_iso(self.conn), archive_id))
+                    processed += 1
+            except DomainError as e:
+                self._fail_archive(archive_id, f"{e.code}: {e.message}")
+            except Exception as e:  # noqa: BLE001 —— 生成中断：留痕为失败，可重试
+                self._fail_archive(archive_id, f"internal: {e}")
+            return self.get_archive(archive_id)
+
+    def drive_archive(self, archive_id: str) -> dict:
+        """驱动归档直到终态（ready/failed/superseded）。"""
+        view = self.get_archive(archive_id)
+        while view["status"] in ("queued", "generating"):
+            view = self.process_archive(archive_id)
+        return view
+
+    def _finalize_archive(self, row):
+        """组装归档包：固定证明 + 固定日志区间 + 委员角色，脱敏后定稿。"""
+        archive_id = row["id"]
+        staged = self.conn.execute(
+            "SELECT seq,event_json FROM archive_events WHERE archive_id=? ORDER BY seq",
+            (archive_id,)).fetchall()
+        seqs = [r["seq"] for r in staged]
+        expected = list(range(row["journal_from"], row["journal_to"] + 1))
+        if seqs != expected:
+            raise Conflict("journal_corrupted",
+                           "归档区间事件不完整（期望 "
+                           f"{row['journal_from']}..{row['journal_to']}，实得 "
+                           f"{len(seqs)} 条），归档中止")
+        events = []
+        for r in staged:
+            ev = json.loads(r["event_json"])
+            # 载荷从库存 JSON 字符串还原为对象——与 append_event/verify_chain
+            # 计算 event_hash 时的规范形式一致，保证包内可独立重算
+            ev["payload"] = json.loads(ev["payload"])
+            events.append(ev)
+        d = self.conn.execute("SELECT * FROM decisions WHERE id=?",
+                              (row["decision_id"],)).fetchone()
+        proof = json.loads(d["proof_bundle"])
+        cohort = self.conn.execute("SELECT trial_id FROM cohorts WHERE cohort_id=?",
+                                   (row["cohort_id"],)).fetchone()
+        # 定稿前复核证明未被改动（请求时校验之后的最后一道闸）
+        recomputed = canonical_hash({k: v for k, v in proof.items() if k != "proof_hash"})
+        if recomputed != d["proof_hash"]:
+            raise Conflict("proof_corrupted", "生成时复核：决策证明哈希与库内不一致，归档中止")
+        policy = row["policy"]
+        # 委员角色信息固定在证明签发时刻（取自证明本身，而非当前库内角色）
+        roster = []
+        for v in proof["votes"]:
+            entry = {"member_id": v["member_id"], "role": v["role"]}
+            if policy == "full":
+                entry["name"] = v["name"]
+            roster.append(entry)
+        if policy == "full":
+            journal_events = events  # 完整事件：可完全独立重算哈希链
+        else:
+            # redacted：隐去操作人与载荷（非必要身份/敏感细节），保留链结构可验
+            journal_events = [
+                {"seq": e["seq"], "event_type": e["event_type"],
+                 "cohort_id": e["cohort_id"], "prev_hash": e["prev_hash"],
+                 "event_hash": e["event_hash"], "created_at": e["created_at"]}
+                for e in events]
+        bundle = {
+            "archive_version": 1,
+            "archive_id": archive_id,
+            "decision_id": row["decision_id"],
+            "cohort_id": row["cohort_id"],
+            "trial_id": cohort["trial_id"],
+            "policy": policy,
+            "generated_at": now_iso(self.conn),
+            "requested_by": row["requested_by"],
+            "journal_range": {
+                "from_seq": row["journal_from"],
+                "to_seq": row["journal_to"],
+                "anchor_prev_hash": events[0]["prev_hash"],
+                "head_hash": events[-1]["event_hash"],
+            },
+            "decision_proof": proof,
+            "committee": roster,
+            "journal_events": journal_events,
+        }
+        bundle["bundle_hash"] = canonical_hash(bundle)
+        ts = now_iso(self.conn)
+        with self.conn:
+            append_event(self.conn, "archive_ready", row["requested_by"], {
+                "archive_id": archive_id, "decision_id": row["decision_id"],
+                "cohort_id": row["cohort_id"], "policy": policy,
+                "journal_from": row["journal_from"], "journal_to": row["journal_to"],
+                "bundle_hash": bundle["bundle_hash"]}, row["cohort_id"])
+            self.conn.execute(
+                "UPDATE archives SET status='ready',bundle=?,bundle_hash=?,error=NULL,"
+                "completed_at=?,updated_at=? WHERE id=?",
+                (_json_dumps(bundle), bundle["bundle_hash"], ts, ts, archive_id))
+            self.conn.execute("DELETE FROM archive_events WHERE archive_id=?",
+                              (archive_id,))
+            # 同一决定+同一策略：新归档就绪后，覆盖更旧区间的就绪归档被取代
+            # （旧包内容不改写，仍可下载验真）
+            self.conn.execute(
+                "UPDATE archives SET status='superseded',updated_at=? "
+                "WHERE decision_id=? AND policy=? AND status='ready' AND journal_to<?",
+                (ts, row["decision_id"], policy, row["journal_to"]))
+            # 续跑完成的旧归档若已有更新归档就绪，则自身直接标记为被取代
+            newer = self.conn.execute(
+                "SELECT 1 FROM archives WHERE decision_id=? AND policy=? AND "
+                "status='ready' AND journal_to>? LIMIT 1",
+                (row["decision_id"], policy, row["journal_to"])).fetchone()
+            if newer:
+                self.conn.execute(
+                    "UPDATE archives SET status='superseded',updated_at=? WHERE id=?",
+                    (ts, archive_id))
+
+    def _fail_archive(self, archive_id: str, error: str):
+        row = self.conn.execute(
+            "SELECT * FROM archives WHERE id=?", (archive_id,)).fetchone()
+        if row is None or row["status"] not in ("queued", "generating"):
+            return
+        ts = now_iso(self.conn)
+        with self.conn:
+            append_event(self.conn, "archive_failed", row["requested_by"], {
+                "archive_id": archive_id, "decision_id": row["decision_id"],
+                "cohort_id": row["cohort_id"], "error": error}, row["cohort_id"])
+            self.conn.execute(
+                "UPDATE archives SET status='failed',error=?,updated_at=? WHERE id=?",
+                (error, ts, archive_id))
+
+    def _require_archive(self, archive_id: str):
+        row = self.conn.execute(
+            "SELECT * FROM archives WHERE id=?", (archive_id,)).fetchone()
+        if row is None:
+            raise NotFound(f"归档 {archive_id}")
+        return row
+
+    def _archive_view(self, row, replayed: bool | None = None) -> dict:
+        head = self._business_journal_head()
+        newer = max(0, head - row["journal_to"])
+        view = {
+            "archive_id": row["id"],
+            "decision_id": row["decision_id"],
+            "cohort_id": row["cohort_id"],
+            "policy": row["policy"],
+            "status": row["status"],
+            "journal_from": row["journal_from"],
+            "journal_to": row["journal_to"],
+            "progress_seq": row["progress_seq"],
+            "total_events": row["journal_to"] - row["journal_from"] + 1,
+            "bundle_hash": row["bundle_hash"],
+            "error": row["error"],
+            "attempt": row["attempt"],
+            "requested_by": row["requested_by"],
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+            "completed_at": row["completed_at"],
+            # 提示稽核员：归档后出现的新事件数（旧包不改写，建议发起覆盖新区间的归档）
+            "newer_events_count": newer,
+            "stale": newer > 0,
+        }
+        if replayed is not None:
+            view["replayed"] = replayed
+        return view
+
+    def get_archive(self, archive_id: str, replayed: bool | None = None) -> dict:
+        return self._archive_view(self._require_archive(archive_id), replayed)
+
+    def list_archives(self, decision_id: str | None = None,
+                      cohort_id: str | None = None) -> list:
+        sql = "SELECT * FROM archives"
+        cond, args = [], []
+        if decision_id:
+            cond.append("decision_id=?")
+            args.append(decision_id)
+        if cohort_id:
+            cond.append("cohort_id=?")
+            args.append(cohort_id)
+        if cond:
+            sql += " WHERE " + " AND ".join(cond)
+        sql += " ORDER BY created_at,id"
+        return [self._archive_view(r) for r in self.conn.execute(sql, args).fetchall()]
+
+    def get_archive_bundle(self, auditor_id: str, token: str, archive_id: str) -> dict:
+        """下载归档包：仅就绪/被取代（内容不变）状态可下载。"""
+        self._require_auditor(auditor_id, token)
+        row = self._require_archive(archive_id)
+        if row["status"] not in ("ready", "superseded"):
+            raise Conflict("archive_not_ready",
+                           f"归档当前状态 {row['status']}，尚不可下载")
+        return json.loads(row["bundle"])
+
+    def verify_archive_bundle(self, auditor_id: str, token: str, bundle: dict) -> dict:
+        """独立验真下载的归档包：重算全部哈希并与账本交叉核对。"""
+        self._require_auditor(auditor_id, token)
+        if not isinstance(bundle, dict):
+            raise ValidationFailed("归档包必须是 JSON 对象")
+        checks = []
+
+        def check(name, ok, detail=""):
+            checks.append({"check": name, "passed": bool(ok), "detail": detail})
+
+        embedded = bundle.get("bundle_hash")
+        recomputed = canonical_hash({k: v for k, v in bundle.items() if k != "bundle_hash"})
+        check("bundle_hash_unchanged", embedded == recomputed,
+              f"recomputed={recomputed[:12]}")
+
+        proof = bundle.get("decision_proof") or {}
+        proof_hash = canonical_hash({k: v for k, v in proof.items() if k != "proof_hash"})
+        d = self.conn.execute("SELECT * FROM decisions WHERE id=?",
+                              (bundle.get("decision_id"),)).fetchone()
+        check("proof_hash_unchanged",
+              d is not None and proof_hash == proof.get("proof_hash") == d["proof_hash"],
+              f"recomputed={proof_hash[:12]}")
+
+        events = bundle.get("journal_events") or []
+        jr = bundle.get("journal_range") or {}
+        policy = bundle.get("policy")
+        live = {r["seq"]: r for r in self.conn.execute(
+            "SELECT * FROM journal WHERE seq BETWEEN ? AND ?",
+            (jr.get("from_seq", 0), jr.get("to_seq", -1))).fetchall()}
+
+        if policy == "full":
+            recompute_ok = all(
+                canonical_hash({
+                    "seq": e.get("seq"), "event_type": e.get("event_type"),
+                    "cohort_id": e.get("cohort_id"), "actor": e.get("actor"),
+                    "payload": e.get("payload"), "prev_hash": e.get("prev_hash"),
+                    "created_at": e.get("created_at"),
+                }) == e.get("event_hash") for e in events)
+            check("journal_events_hash_recomputed", recompute_ok,
+                  f"events={len(events)}")
+        ledger_ok = all(
+            e.get("seq") in live and live[e.get("seq")]["event_hash"] == e.get("event_hash")
+            for e in events)
+        check("journal_events_match_ledger", ledger_ok,
+              "逐条对照当前账本事件哈希")
+
+        link_ok = True
+        prev = None
+        for e in events:
+            if prev is not None and e.get("prev_hash") != prev:
+                link_ok = False
+                break
+            prev = e.get("event_hash")
+        if events:
+            first_seq = events[0].get("seq")
+            anchor = self.conn.execute(
+                "SELECT event_hash FROM journal WHERE seq=?",
+                (first_seq - 1,)).fetchone()
+            expected_anchor = anchor["event_hash"] if anchor else GENESIS_HASH
+            link_ok = link_ok and events[0].get("prev_hash") == expected_anchor
+        check("journal_chain_links_intact", link_ok, "区间内外哈希链衔接")
+
+        seqs = [e.get("seq") for e in events]
+        range_ok = (seqs == list(range(jr.get("from_seq", 0), jr.get("to_seq", -1) + 1))
+                    and (not events or events[-1].get("seq") == jr.get("to_seq")))
+        head_row = live.get(jr.get("to_seq"))
+        range_ok = range_ok and head_row is not None \
+            and head_row["event_hash"] == jr.get("head_hash")
+        check("journal_range_exact_no_late_events", range_ok,
+              f"{jr.get('from_seq')}..{jr.get('to_seq')} 完整且无后续日志混入")
+
+        decision_seq = self.conn.execute(
+            "SELECT seq FROM journal WHERE event_type='decision_issued' AND "
+            "json_extract(payload,'$.decision_id')=?", (bundle.get("decision_id"),)
+        ).fetchone()
+        check("decision_event_within_range",
+              decision_seq is not None
+              and jr.get("from_seq", 0) <= decision_seq["seq"] <= jr.get("to_seq", -1),
+              f"decision_issued@{decision_seq['seq'] if decision_seq else '?'}")
+
+        roster = {m.get("member_id"): m.get("role") for m in bundle.get("committee") or []}
+        votes = proof.get("votes") or []
+        check("committee_roles_cover_voters",
+              bool(votes) and all(
+                  roster.get(v.get("member_id")) == v.get("role") for v in votes),
+              f"voters={len(votes)} roster={len(roster)}")
+
+        secrets = {r["hmac_key"] for r in self.conn.execute(
+            "SELECT hmac_key FROM committee_members").fetchall()}
+        secrets |= {r["token"] for r in self.conn.execute(
+            "SELECT token FROM auditors").fetchall()}
+        leaks = []
+
+        def _scan(obj, path="$"):
+            if isinstance(obj, dict):
+                for k, v in obj.items():
+                    if k in ("hmac_key", "token", "hmac_secret"):
+                        leaks.append(f"{path}.{k}")
+                    _scan(v, f"{path}.{k}")
+            elif isinstance(obj, list):
+                for i, v in enumerate(obj):
+                    _scan(v, f"{path}[{i}]")
+            elif isinstance(obj, str) and obj in secrets:
+                leaks.append(f"{path}=已知密钥/令牌值")
+
+        _scan(bundle)
+        check("no_personal_key_material", not leaks,
+              "；".join(leaks[:3]) if leaks else "不含委员密钥/稽核员令牌")
+
+        if policy == "redacted":
+            red_ok = all("actor" not in e and "payload" not in e for e in events) \
+                and all("name" not in m for m in bundle.get("committee") or [])
+            check("redaction_policy_respected", red_ok,
+                  "精简包不含日志操作人/载荷与委员姓名")
+
+        return {"archive_id": bundle.get("archive_id"),
+                "decision_id": bundle.get("decision_id"),
+                "verified": all(c["passed"] for c in checks),
+                "checks": checks}
+
     # ------------------------------------------------------------- 查询/时钟
     def advance_clock(self, ts: str) -> dict:
         with self.conn:
@@ -1242,6 +1738,11 @@ class Services:
             "SELECT id,cohort_id,snapshot_id,action,outcome,child_cohort_id,"
             "proof_hash,created_at FROM decisions ORDER BY created_at")]
         drafts = self.list_vote_drafts()
+        archives = self.list_archives()
+        auditors = [{"auditor_id": r["auditor_id"], "name": r["name"],
+                     "active": bool(r["active"])}
+                    for r in self.conn.execute(
+                        "SELECT * FROM auditors ORDER BY auditor_id")]
         chain = verify_chain(self.conn)
         return {
             "now": now_iso(self.conn),
@@ -1253,6 +1754,8 @@ class Services:
             "snapshots": snapshots,
             "decisions": decisions,
             "drafts": drafts,
+            "archives": archives,
+            "auditors": auditors,
             "journal": {"events": chain["events"], "head": chain["head"][:16],
                         "chain_ok": chain["ok"]},
         }

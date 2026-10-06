@@ -73,9 +73,9 @@ const API = '';
 let S = null, CID = null, SID = null, DID = null;
 let OFFLINE = false;
 
-async function api(method, path, body){
+async function api(method, path, body, headers){
   if(OFFLINE) throw Object.assign(new Error('断网模拟中：请求未发送'),{code:'offline'});
-  const opt = {method, headers:{'Content-Type':'application/json','X-Actor':'workbench'}};
+  const opt = {method, headers:{'Content-Type':'application/json','X-Actor':'workbench',...(headers||{})}};
   if(body) opt.body = JSON.stringify(body);
   let r;
   try{ r = await fetch(API+path, opt); }
@@ -354,7 +354,94 @@ function renderRight(){
       <button class="ok" onclick="verifyProof('${d.id}')">独立校验证明</button></div>`;
   }
   if(DID){ const d=S.decisions.find(x=>x.id===DID); }
+  h+=renderArchives();
   el.innerHTML=h;
+}
+
+// ---------------- 监管稽核归档 ----------------
+function renderArchives(){
+  const decs=S.decisions.filter(x=>x.cohort_id===CID);
+  const audId=(document.getElementById('audId')||{}).value||'AUD-01';
+  const audTok=(document.getElementById('audTok')||{}).value||'demo-audit-token';
+  let h='<h2 style="margin-top:10px">监管稽核归档</h2>';
+  h+=`<div class="row"><input id="audId" value="${esc(audId)}" style="width:100px" title="稽核员 ID">
+      <input id="audTok" value="${esc(audTok)}" style="width:170px" title="稽核员令牌">
+      <span class="mut small">稽核员身份（演示预填）</span></div>`;
+  if(!decs.length){ h+='<div class="mut small">尚无已签发决定；签发决定后可在此发起归档。</div>'; return h; }
+  const tags={queued:'<span class="tag t-warn">排队中</span>',
+    generating:'<span class="tag t-info">生成中</span>',
+    ready:'<span class="tag t-ok">可下载</span>',
+    failed:'<span class="tag t-bad">失败</span>',
+    superseded:'<span class="tag t-draft">已被新归档取代</span>'};
+  for(const d of decs){
+    const archs=(S.archives||[]).filter(a=>a.decision_id===d.id);
+    h+=`<div class="item"><b>${d.id}</b> <span class="tag t-info">${d.action}</span>
+      <div class="row"><select id="pol-${d.id}" style="width:200px">
+        <option value="full">完整包（含日志载荷）</option>
+        <option value="redacted">精简包（脱敏）</option></select>
+        <button onclick="requestArchive('${d.id}')">发起归档</button></div>`;
+    for(const a of archs){
+      h+=`<div class="item"><b>${a.archive_id}</b> ${tags[a.status]||a.status}
+        <div class="mut small">${a.policy==='full'?'完整':'精简'} · 日志区间 ${a.journal_from}–${a.journal_to} · 第 ${a.attempt} 次尝试</div>`;
+      if(a.status==='generating')
+        h+=`<div class="mut small">已固定区间，进度 ${a.progress_seq}/${a.journal_to}（中断后续跑，不混入后续日志）</div>`;
+      if(a.error) h+=`<div class="small" style="color:var(--bad)">⛔ ${esc(a.error)}</div>`;
+      if(a.stale&&(a.status==='ready'||a.status==='superseded'))
+        h+=`<div class="small" style="color:var(--warn)">⚠ 归档后出现 ${a.newer_events_count} 条新事件：旧包不会被改写；建议再次「发起归档」覆盖新区间（本包将标记为被取代，仍可下载验真）</div>`;
+      h+='<div class="row">';
+      if(a.status==='ready'||a.status==='superseded')
+        h+=`<button class="ok" onclick="downloadArchive('${a.archive_id}')">下载</button>
+            <button class="ghost" onclick="document.getElementById('vf').click()">校验下载内容</button>`;
+      if(a.status==='failed')
+        h+=`<button onclick="requestArchive('${d.id}','${a.policy}')">重试</button>`;
+      h+='</div>';
+      if(a.bundle_hash) h+=`<div class="mono small">bundle=${a.bundle_hash.slice(0,28)}…</div>`;
+      h+='</div>';
+    }
+    h+='</div>';
+  }
+  h+='<input type="file" id="vf" style="display:none" accept=".json" onchange="verifyArchiveFile(this)">';
+  return h;
+}
+function auditHdrs(){
+  return {'X-Auditor-Id':(document.getElementById('audId')||{}).value||'',
+          'X-Auditor-Token':(document.getElementById('audTok')||{}).value||''};
+}
+async function requestArchive(decisionId, policy){
+  const pol=policy||((document.getElementById('pol-'+decisionId)||{}).value)||'full';
+  try{
+    const r=await api('POST','/api/archives',{decision_id:decisionId,policy:pol},auditHdrs());
+    toast(r.replayed?'相同决定+策略的归档已存在：幂等回放，未生成第二份'
+        :'归档已生成 '+r.archive_id+'（状态 '+r.status+'）', r.status==='failed');
+    await load();
+  }catch(e){ toast('归档被拒绝：'+e.message,true); }
+}
+async function downloadArchive(id){
+  try{
+    const r=await fetch(API+'/api/archives/'+id+'/download',{headers:auditHdrs()});
+    if(!r.ok){ const j=await r.json().catch(()=>({})); throw new Error(j.message||r.statusText); }
+    const blob=await r.blob();
+    const a=document.createElement('a');
+    a.href=URL.createObjectURL(blob); a.download='archive-'+id+'.json'; a.click();
+    URL.revokeObjectURL(a.href);
+    toast('归档包已下载（内容固定，可独立验真）');
+  }catch(e){ toast('下载失败：'+e.message,true); }
+}
+async function verifyArchiveFile(input){
+  const f=input.files&&input.files[0]; input.value='';
+  if(!f) return;
+  let bundle;
+  try{ bundle=JSON.parse(await f.text()); }
+  catch(e){ toast('所选文件不是合法 JSON',true); return; }
+  try{
+    const r=await api('POST','/api/archives/verify',{bundle},auditHdrs());
+    toast((r.verified?'✅ 归档包验真通过':'⛔ 归档包验真失败')
+      +'（'+r.checks.filter(c=>c.passed).length+'/'+r.checks.length+' 项）',!r.verified);
+    const detail=r.checks.map(c=>`${c.passed?'✅':'❌'} ${c.check} ${c.detail?'· '+c.detail:''}`).join('\n');
+    const el=document.getElementById('right');
+    el.insertAdjacentHTML('afterbegin',
+      `<div class="item"><b>归档包验真报告 ${esc(r.archive_id||'')}</b><pre>${esc(detail)}</pre></div>`);
+  }catch(e){ toast('验真请求失败：'+e.message,true); }
 }
 
 async function pubRule(){

@@ -202,6 +202,40 @@ CREATE TABLE IF NOT EXISTS holds (
   released_at TEXT
 );
 
+CREATE TABLE IF NOT EXISTS auditors (
+  auditor_id TEXT PRIMARY KEY,
+  name       TEXT NOT NULL,
+  token      TEXT NOT NULL,            -- 稽核员访问令牌（演示环境为明文 demo 令牌）
+  active     INTEGER NOT NULL DEFAULT 1
+);
+
+CREATE TABLE IF NOT EXISTS archives (
+  id           TEXT PRIMARY KEY,
+  decision_id  TEXT NOT NULL,
+  cohort_id    TEXT NOT NULL,
+  policy       TEXT NOT NULL,          -- 导出策略 full|redacted
+  status       TEXT NOT NULL,          -- queued|generating|ready|failed|superseded
+  dedup_key    TEXT NOT NULL UNIQUE,   -- 决定|策略|固定日志头：同参并发请求只落一行
+  journal_from INTEGER NOT NULL,       -- 固定的日志区间起点（队列创建事件）
+  journal_to   INTEGER NOT NULL,       -- 固定的日志区间终点（请求时的业务日志头）
+  progress_seq INTEGER NOT NULL,       -- 断点：已暂存到的日志序号
+  bundle       TEXT,                   -- 完成后的归档包 JSON（生成后不再改写）
+  bundle_hash  TEXT,
+  error        TEXT,
+  attempt      INTEGER NOT NULL DEFAULT 1,
+  requested_by TEXT NOT NULL,          -- 发起稽核员
+  created_at   TEXT NOT NULL,
+  updated_at   TEXT NOT NULL,
+  completed_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS archive_events (
+  archive_id TEXT NOT NULL,
+  seq        INTEGER NOT NULL,         -- 已暂存的日志序号（严格 <= journal_to）
+  event_json TEXT NOT NULL,
+  PRIMARY KEY (archive_id, seq)
+);
+
 CREATE INDEX IF NOT EXISTS idx_journal_cohort ON journal(cohort_id, seq);
 CREATE INDEX IF NOT EXISTS idx_subjects_cohort ON subjects(cohort_id);
 CREATE INDEX IF NOT EXISTS idx_ae_cohort ON adverse_events(cohort_id);
@@ -209,6 +243,7 @@ CREATE INDEX IF NOT EXISTS idx_pending_cohort ON pending_data(cohort_id, status)
 CREATE INDEX IF NOT EXISTS idx_votes_snapshot ON votes(snapshot_id);
 CREATE INDEX IF NOT EXISTS idx_drafts_cohort ON vote_drafts(cohort_id);
 CREATE INDEX IF NOT EXISTS idx_decisions_cohort ON decisions(cohort_id);
+CREATE INDEX IF NOT EXISTS idx_archives_decision ON archives(decision_id);
 """
 
 # 使旧快照失效的“实质性事件”：迟到 AE / AE 评估变更 / 替补 / 给药事实。
@@ -219,6 +254,14 @@ MATERIAL_EVENT_TYPES = {
     "ae_reported",
     "ae_adjudicated",
     "subject_replaced",
+}
+
+# 归档系统自身的生命周期事件：记入哈希链以供审计，但不计入「业务日志头」，
+# 因此归档操作不会推动归档区间，也不会被误判为「新的安全事实」。
+ARCHIVE_EVENT_TYPES = {
+    "archive_requested",
+    "archive_ready",
+    "archive_failed",
 }
 
 

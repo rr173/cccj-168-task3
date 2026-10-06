@@ -232,6 +232,55 @@ def main():
     q = svc.list_vote_drafts(cid2)
     print("  草稿队列：", ", ".join(f"{x['draft_id']}={x['status']}" for x in q))
 
+    line("14. 监管稽核归档：授权稽核员固定证明+日志区间+委员角色，生成可独立验真的包")
+    AUD = ("AUD-01", "demo-audit-token")
+    expect_conflict("无稽核员权限发起归档",
+                    lambda: svc.request_archive("AUD-01", "wrong-token",
+                                                d2["decision_id"], "full"))
+    # 生成中断（注入故障）→ failed；重试后断点续跑成功，仍只有一份归档
+    svc._archive_chunk_size = 4
+    ar = svc.request_archive(*AUD, d2["decision_id"], "full")
+    print(f"  归档 {ar['archive_id']} 已排队：固定日志区间 "
+          f"{ar['journal_from']}–{ar['journal_to']}（共 {ar['total_events']} 条）")
+    svc._archive_fault_hook = lambda n: (_ for _ in ()).throw(
+        RuntimeError("模拟生成中断")) if n == 1 else None
+    ar = svc.process_archive(ar["archive_id"])
+    print(f"  生成中断：status={ar['status']} error={ar['error']}")
+    svc._archive_fault_hook = None
+    ar = svc.request_archive(*AUD, d2["decision_id"], "full")  # 同一去重键重试
+    ar = svc.drive_archive(ar["archive_id"])
+    print(f"  重试续跑：status={ar['status']}（第 {ar['attempt']} 次尝试，仍只有 1 份归档）")
+    # 相同决定+相同策略的重复请求：幂等回放，不生成第二份
+    again = svc.request_archive(*AUD, d2["decision_id"], "full")
+    print(f"  重复请求：replayed={again['replayed']} 同一归档={again['archive_id'] == ar['archive_id']}")
+    # 下载并独立验真；redacted 精简包脱敏
+    bundle = svc.get_archive_bundle(*AUD, ar["archive_id"])
+    rep = svc.verify_archive_bundle(*AUD, bundle)
+    print(f"  完整包验真：verified={rep['verified']} "
+          f"（{sum(c['passed'] for c in rep['checks'])}/{len(rep['checks'])} 项）")
+    ar2 = svc.drive_archive(
+        svc.request_archive(*AUD, d2["decision_id"], "redacted")["archive_id"])
+    b2 = svc.get_archive_bundle(*AUD, ar2["archive_id"])
+    print(f"  精简包：日志字段={sorted(b2['journal_events'][0].keys())}")
+    print(f"        委员名册={b2['committee']}（不含姓名/密钥）")
+    # 归档操作本身不影响既有证明校验
+    print(f"  归档后原有证明校验不受影响：verified={svc.verify_proof(d2['decision_id'])['verified']}")
+    # 归档后出现新的安全事实：旧包不改写，提示创建覆盖新区间的归档
+    svc.report_ae("crc", cid2, sids2[0], "迟报：皮疹", "grade2",
+                  "2026-11-12T00:00:00+00:00")
+    view = svc.get_archive(ar["archive_id"])
+    print(f"  新事件后：stale={view['stale']}（新增 {view['newer_events_count']} 条），"
+          "旧包内容不变")
+    ar3 = svc.drive_archive(
+        svc.request_archive(*AUD, d2["decision_id"], "full")["archive_id"])
+    print(f"  覆盖新区间的新归档 {ar3['archive_id']}：区间至 {ar3['journal_to']}；"
+          f"旧归档状态={svc.get_archive(ar['archive_id'])['status']}（仍可下载验真="
+          f"{svc.verify_archive_bundle(*AUD, svc.get_archive_bundle(*AUD, ar['archive_id']))['verified']}）")
+    # 迟到 AE 按平台既有语义使快照新鲜度检查翻转（与归档无关），完整性检查仍全过
+    failing = [c["check"] for c in svc.verify_proof(d2["decision_id"])["checks"]
+               if not c["passed"]]
+    print(f"  迟到 AE 后证明校验的新鲜度项按既有语义变化：{failing}（完整性项仍全过）")
+
 
 if __name__ == "__main__":
     main()
