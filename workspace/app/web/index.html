@@ -73,9 +73,10 @@ const API = '';
 let S = null, CID = null, SID = null, DID = null;
 let OFFLINE = false;
 
-async function api(method, path, body){
+async function api(method, path, body, audKey){
   if(OFFLINE) throw Object.assign(new Error('断网模拟中：请求未发送'),{code:'offline'});
   const opt = {method, headers:{'Content-Type':'application/json','X-Actor':'workbench'}};
+  if(audKey) opt.headers['X-Auditor-Key']=audKey;
   if(body) opt.body = JSON.stringify(body);
   let r;
   try{ r = await fetch(API+path, opt); }
@@ -116,6 +117,7 @@ async function load(){
   catch(e){ if(e.code!=='offline') toast('状态刷新失败：'+e.message,true); }
   if(!S) return;
   renderLeft(); renderCenter(); renderRight();
+  if(CID) loadArchives();
   document.getElementById('clock').textContent=S.now.replace('T',' ').slice(0,19)+' UTC';
   const tag=document.getElementById('chainTag');
   tag.textContent='哈希链 '+S.journal.events+' 事件';
@@ -351,7 +353,24 @@ function renderRight(){
     h+=`<div class="item"><b>${d.id}</b> <span class="tag t-info">${d.action}</span>
       <div class="mut small">引擎=${d.outcome} · 快照 ${d.snapshot_id}${d.child_cohort_id?' · 派生 '+d.child_cohort_id:''}</div>
       <button class="ghost" onclick="showProof('${d.id}')">查看决策证明</button>
-      <button class="ok" onclick="verifyProof('${d.id}')">独立校验证明</button></div>`;
+      <button class="ok" onclick="verifyProof('${d.id}')">独立校验证明</button>
+      <button class="ghost" onclick="requestArchive('${d.id}',false)">📦 发起归档</button></div>`;
+  }
+  // 监管稽核归档工作区：排队/生成中/可下载/失败/已被新归档取代
+  if(CID){
+    const audKey=localStorage.getItem('audKey')||'demo-auditor-key';
+    const polRedact=localStorage.getItem('polRedact')==='1';
+    const simMode=localStorage.getItem('simMode')||'';
+    h+=`<h2 style="margin-top:10px">监管稽核归档</h2>
+      <div class="row"><input id="audKey" placeholder="稽核员密钥" value="${esc(audKey)}" onchange="localStorage.setItem('audKey',this.value);loadArchives()"></div>
+      <div class="row small">
+        <label><input type="checkbox" id="polRedact" style="width:auto" ${polRedact?'checked':''} onchange="localStorage.setItem('polRedact',this.checked?'1':'0')"> 隐藏非必要身份（委员姓名）</label>
+        <label>演示：<select id="simMode" style="width:auto" onchange="localStorage.setItem('simMode',this.value)">
+          <option value="" ${simMode===''?'selected':''}>正常生成</option>
+          <option value="crash" ${simMode==='crash'?'selected':''}>中断后续传</option>
+          <option value="fail" ${simMode==='fail'?'selected':''}>失败后重试</option>
+        </select></label></div>
+      <div id="archBox"><div class="mut small">归档状态加载中…</div></div>`;
   }
   if(DID){ const d=S.decisions.find(x=>x.id===DID); }
   el.innerHTML=h;
@@ -459,6 +478,104 @@ async function tamperProof(id){
   const el=document.getElementById('right');
   el.insertAdjacentHTML('afterbegin',`<div class="item"><b>篡改件校验报告</b>
     <pre>${esc(r.checks.map(c=>(c.passed?'✅':'❌')+' '+c.check).join('\n'))}</pre></div>`);
+}
+
+// ---------------- 监管稽核归档 ----------------
+const ARCH_ST={queued:['排队中','t-warn'],building:['生成中','t-info'],ready:['可下载','t-ok'],
+  failed:['失败','t-bad'],superseded:['已被新归档取代','t-closed']};
+function audKeyVal(){ const el=document.getElementById('audKey'); return (el&&el.value)||localStorage.getItem('audKey')||''; }
+async function loadArchives(){
+  const box=document.getElementById('archBox'); if(!box||!CID) return;
+  let r;
+  try{ r=await api('GET','/api/archives?cohort_id='+encodeURIComponent(CID),null,audKeyVal()); }
+  catch(e){
+    box.innerHTML=e.code==='offline'
+      ?'<div class="mut small">断网中：归档状态不可用</div>'
+      :'<div class="mut small">⛔ '+esc(e.message)+'（归档操作需要有效稽核员密钥）</div>';
+    return;
+  }
+  window.__arch={};
+  for(const a of r.archives) window.__arch[a.archive_id]=a;
+  if(!r.archives.length){ box.innerHTML='<div class="mut small">尚无归档。在上方「已签发决定」点「发起归档」。</div>'; return; }
+  box.innerHTML=r.archives.map(archItem).join('');
+}
+function archItem(a){
+  const st=ARCH_ST[a.status]||[a.status,'t-draft'];
+  let h=`<div class="item"><b>${a.archive_id}</b> <span class="tag ${st[1]}">${st[0]}</span>
+    <div class="mut small">决定 ${a.decision_id} · 日志区间 ${a.log_range.seq_from}..${a.log_range.seq_to} 已固定 · 策略 ${a.policy_hash.slice(0,8)} · ${esc(a.requested_by)}</div>`;
+  if(a.policy&&a.policy.redact_member_names) h+='<div class="mut small">🔒 已隐藏非必要身份（委员姓名）；个人密钥任何策略下不导出</div>';
+  if(a.status==='building'&&a.progress)
+    h+=`<div class="mut small">检查点：日志已固定至 seq=${a.progress.built_upto_seq||0}/${a.log_range.seq_to}（续传不会混入后续日志）</div>`;
+  if(a.status==='failed') h+=`<div class="small" style="color:var(--bad)">⛔ ${esc(a.error||'')}</div>`;
+  if(a.status==='ready'&&a.package_hash) h+=`<div class="mono small">package_hash=${a.package_hash.slice(0,24)}…</div>`;
+  if(a.status==='superseded') h+=`<div class="mut small">被 ${a.superseded_by} 取代；旧包内容不被改写，仍可下载验真</div>`;
+  if(a.freshness&&a.freshness.stale) h+=`<div class="small" style="color:var(--warn)">⚠ ${esc(a.freshness.hint)}</div>`;
+  h+='<div class="row">';
+  if(a.status==='queued') h+=`<button onclick="buildArchive('${a.archive_id}')">开始生成</button>`;
+  if(a.status==='building') h+=`<button onclick="buildArchive('${a.archive_id}')">继续生成（续传）</button>`;
+  if(a.status==='failed') h+=`<button onclick="buildArchive('${a.archive_id}')">重试生成</button>`;
+  if(a.status==='ready'||a.status==='superseded')
+    h+=`<button class="ok" onclick="downloadArchive('${a.archive_id}')">下载包</button>
+        <button class="ghost" onclick="verifyArchive('${a.archive_id}')">校验下载内容</button>`;
+  if(a.status==='ready'&&a.freshness&&a.freshness.stale)
+    h+=`<button class="danger" onclick="renewArchive('${a.archive_id}')">创建覆盖新区间的归档</button>`;
+  h+=`</div><div id="vrep-${a.archive_id}"></div></div>`;
+  return h;
+}
+async function requestArchive(decisionId, renew, policy){
+  policy=policy||{redact_member_names:document.getElementById('polRedact')?.checked||false};
+  // 幂等键：同决定同策略稳定（重复点击/重试只回放）；renew 需新键
+  const rid='ARQ-'+decisionId+'-'+(policy.redact_member_names?'R':'S')+(renew?'-'+Date.now():'');
+  try{
+    const r=await api('POST','/api/archives',{decision_id:decisionId,policy,request_id:rid,renew:!!renew},audKeyVal());
+    const a=r.archive;
+    toast(r.replayed?'相同决定+相同策略的归档已存在：幂等回放 '+a.archive_id
+      :'归档请求已登记 '+a.archive_id+'：日志区间 1..'+a.log_range.seq_to+' 已固定');
+    await load();
+  }catch(e){ toast('归档请求失败：'+e.message,true); }
+}
+async function renewArchive(aid){
+  const a=window.__arch&&window.__arch[aid]; if(!a) return;
+  await requestArchive(a.decision_id,true,a.policy);  // 沿用旧归档的导出策略
+}
+async function buildArchive(aid){
+  const mode=document.getElementById('simMode')?.value||'';
+  const body={};
+  if(mode==='crash') body.simulate_crash_after=1;
+  if(mode==='fail') body.simulate_fail=true;
+  try{
+    const r=await api('POST',`/api/archives/${aid}/build`,body,audKeyVal());
+    const a=r.archive;
+    if(a.status==='ready') toast('归档包已生成：'+String(a.package_hash||'').slice(0,16)+'…');
+    else if(a.status==='building') toast('生成中断：检查点已持久化，可继续生成（不会混入后续日志）',true);
+    else if(a.status==='failed') toast('生成失败：'+(a.error||''),true);
+    await load();
+  }catch(e){ toast('生成失败：'+e.message,true); await load(); }
+}
+async function fetchPackage(aid){
+  const r=await fetch(`/api/archives/${aid}/download`,{headers:{'X-Auditor-Key':audKeyVal()}});
+  const j=await r.json().catch(()=>({}));
+  if(!r.ok) throw Object.assign(new Error(j.message||r.statusText),{code:j.error});
+  return j;
+}
+async function downloadArchive(aid){
+  try{
+    const pkg=await fetchPackage(aid);
+    const blob=new Blob([JSON.stringify(pkg,null,1)],{type:'application/json'});
+    const a=document.createElement('a');
+    a.href=URL.createObjectURL(blob); a.download='archive-'+aid+'.json'; a.click();
+    toast('归档包已下载（package_hash='+String(pkg.package_hash||'').slice(0,12)+'…）');
+  }catch(e){ toast('下载失败：'+e.message,true); }
+}
+async function verifyArchive(aid){
+  try{
+    const pkg=await fetchPackage(aid);  // 校验的是真实下载到的内容
+    const v=await api('POST',`/api/archives/${aid}/verify`,{package:pkg},audKeyVal());
+    toast((v.verified?'✅ 下载内容独立验真通过':'⛔ 验真失败')
+      +'（'+v.checks.filter(c=>c.passed).length+'/'+v.checks.length+' 项）',!v.verified);
+    const box=document.getElementById('vrep-'+aid);
+    if(box) box.innerHTML=`<pre>${esc(v.checks.map(c=>(c.passed?'✅':'❌')+' '+c.check+(c.detail?' · '+c.detail:'')).join('\n'))}</pre>`;
+  }catch(e){ toast('校验失败：'+e.message,true); }
 }
 
 // ---------------- 断网草稿动作 ----------------

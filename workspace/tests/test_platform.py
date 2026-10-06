@@ -9,8 +9,9 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from app.archives import verify_package
 from app.crypto import canonical_hash, canonical_json, hmac_hex
-from app.errors import Conflict, DomainError
+from app.errors import Conflict, DomainError, Forbidden
 from app.services import Services
 from app.store import connect
 
@@ -197,8 +198,9 @@ class PlatformTest(PlatformBase):
         t1.start(); t2.start(); t1.join(); t2.join()
         # 恰好一个成功，另一个收到版本冲突——不存在基于陈旧视图的合并
         self.assertEqual(sorted(results.values()), ["ok", "snapshot_version_conflict"])
-        # 失败者用新版本重试后成功
-        self.vote(sid, "CM-ELN", "escalate", 1, ch=ch)
+        # 失败者（并发获胜方不确定，动态定位）用新版本重试后成功
+        loser = next(m for m, r in results.items() if r != "ok")
+        self.vote(sid, loser, "escalate", 1, ch=ch)
         d = self.svc.issue_decision("test", sid)
         self.assertEqual(d["action"], "escalate")
         self.assertTrue(self.svc.verify_proof(d["decision_id"])["verified"])
@@ -607,6 +609,321 @@ class OfflineDraftTest(PlatformBase):
         self.assertEqual(d["action"], "escalate")
         v = self.svc.verify_proof(d["decision_id"])
         self.assertTrue(v["verified"], msg=json.dumps(v["checks"], ensure_ascii=False))
+
+
+AUD_KEY = "demo-auditor-key"
+
+
+class ArchiveTest(PlatformBase):
+    """监管稽核决定归档包：授权、幂等、固定区间续传、独立验真、取代与提示。"""
+
+    def decided(self):
+        """走完 冻结→给药→窗口→快照→双独立委员投票→签发 的队列，返回 (cid, decision_id)。"""
+        cid = self.cid()
+        self.enroll_freeze_dose(cid)
+        self.close_windows()
+        sid = self.svc.create_snapshot("test", cid)["snapshot_id"]
+        d = self.two_votes_and_decide(sid)
+        return cid, d["decision_id"]
+
+    def head_seq(self):
+        return self.conn.execute(
+            "SELECT seq FROM journal ORDER BY seq DESC LIMIT 1").fetchone()["seq"]
+
+    def ready_archive(self, decision_id, policy=None):
+        r = self.svc.archives.request_archive(AUD_KEY, decision_id, policy)
+        aid = r["archive"]["archive_id"]
+        self.svc.archives.build_archive(AUD_KEY, aid)
+        return aid
+
+    def get_package(self, aid):
+        return json.loads(self.svc.archives.get_package(AUD_KEY, aid))
+
+    # ------------------------------------------------ 授权
+    def test_unauthorized_rejected_everywhere(self):
+        cid, did = self.decided()
+        for fn in (
+            lambda: self.svc.archives.request_archive(None, did),
+            lambda: self.svc.archives.request_archive("wrong-key", did),
+            lambda: self.svc.archives.list_archives(None),
+            lambda: self.svc.archives.get_package("bad", "AR-x"),
+            lambda: self.svc.archives.verify_archive(None, "AR-x"),
+        ):
+            with self.assertRaises(Forbidden):
+                fn()
+        # 未授权不产生任何归档记录
+        self.assertEqual(self.svc.archives.list_archives(AUD_KEY), [])
+
+    # ------------------------------------------------ 请求：固定区间 + 幂等
+    def test_request_pins_range_and_replays(self):
+        cid, did = self.decided()
+        head = self.head_seq()
+        r = self.svc.archives.request_archive(AUD_KEY, did, request_id="RQ-1")
+        a = r["archive"]
+        self.assertFalse(r["replayed"])
+        self.assertEqual(a["status"], "queued")
+        self.assertEqual(a["log_range"]["seq_to"], head)  # 请求当时的链头被固定
+        self.assertEqual(a["log_range"]["seq_from"], 1)
+        # 同一 request_id 回放；同决定同策略（无 request_id）也回放同一份
+        r2 = self.svc.archives.request_archive(AUD_KEY, did, request_id="RQ-1")
+        r3 = self.svc.archives.request_archive(AUD_KEY, did)
+        self.assertTrue(r2["replayed"] and r3["replayed"])
+        self.assertEqual(r2["archive"]["archive_id"], a["archive_id"])
+        self.assertEqual(r3["archive"]["archive_id"], a["archive_id"])
+        rows = self.conn.execute(
+            "SELECT COUNT(*) c FROM decision_archives WHERE decision_id=?",
+            (did,)).fetchone()["c"]
+        self.assertEqual(rows, 1)  # 只能生成一份结果
+
+    def test_concurrent_requests_single_archive(self):
+        cid, did = self.decided()
+        results, errors = [], []
+
+        def req():
+            try:
+                r = self.svc.archives.request_archive(AUD_KEY, did)
+                results.append(r["archive"]["archive_id"])
+            except DomainError as e:  # noqa: BLE001
+                errors.append(e.code)
+
+        ts = [threading.Thread(target=req) for _ in range(6)]
+        [t.start() for t in ts]
+        [t.join() for t in ts]
+        self.assertEqual(errors, [])
+        self.assertEqual(len(set(results)), 1)  # 并发请求只生成一份结果
+        rows = self.conn.execute(
+            "SELECT COUNT(*) c FROM decision_archives WHERE decision_id=?",
+            (did,)).fetchone()["c"]
+        self.assertEqual(rows, 1)
+
+    # ------------------------------------------------ 参数冲突
+    def test_param_conflict_rejected(self):
+        cid, did = self.decided()
+        cid2, did2 = self.decided()
+        self.svc.archives.request_archive(AUD_KEY, did, request_id="RQ-X")
+        # 同一 request_id 携带不同策略 → 409
+        with self.assertRaises(Conflict) as cm:
+            self.svc.archives.request_archive(
+                AUD_KEY, did, policy={"redact_member_names": True}, request_id="RQ-X")
+        self.assertEqual(cm.exception.code, "archive_param_conflict")
+        # 同一 request_id 携带不同决定 → 409
+        with self.assertRaises(Conflict) as cm:
+            self.svc.archives.request_archive(AUD_KEY, did2, request_id="RQ-X")
+        self.assertEqual(cm.exception.code, "archive_param_conflict")
+        # 未知策略项 → 422
+        with self.assertRaises(DomainError) as cm:
+            self.svc.archives.request_archive(AUD_KEY, did, policy={"bogus": True})
+        self.assertEqual(cm.exception.code, "validation_failed")
+
+    # ------------------------------------------------ 证明损坏拒绝
+    def test_proof_corrupted_rejected(self):
+        cid, did = self.decided()
+        stored = json.loads(self.conn.execute(
+            "SELECT proof_bundle FROM decisions WHERE id=?", (did,)).fetchone()["proof_bundle"])
+        stored["action"] = "stop"  # 篡改封存证明
+        self.conn.execute("UPDATE decisions SET proof_bundle=? WHERE id=?",
+                          (json.dumps(stored), did))
+        with self.assertRaises(Conflict) as cm:
+            self.svc.archives.request_archive(AUD_KEY, did)
+        self.assertEqual(cm.exception.code, "proof_corrupted")
+
+    # ------------------------------------------------ 生成 + 独立验真
+    def test_build_ready_package_verifies_independently(self):
+        cid, did = self.decided()
+        aid = self.ready_archive(did)
+        view = self.svc.archives.get_archive(AUD_KEY, aid)
+        self.assertEqual(view["status"], "ready")
+        pkg = self.get_package(aid)
+        # 包哈希稳定；递归扫描无个人密钥
+        self.assertEqual(pkg["package_hash"], view["package_hash"])
+        self.assertFalse(self._has_key(pkg, "hmac_key"))
+        # 独立验真（纯函数，不查库）
+        v = verify_package(pkg)
+        self.assertTrue(v["verified"], msg=json.dumps(v["checks"], ensure_ascii=False))
+        # 服务端校验端点同一结论
+        v2 = self.svc.archives.verify_archive(AUD_KEY, aid, package=pkg)
+        self.assertTrue(v2["verified"])
+        # 区间外不得有任何事件
+        seq_to = view["log_range"]["seq_to"]
+        self.assertEqual(len(pkg["journal"]), seq_to)
+        self.assertEqual(max(e["seq"] for e in pkg["journal"]), seq_to)
+
+    def _has_key(self, obj, key):
+        if isinstance(obj, dict):
+            return any(k == key or self._has_key(v, key) for k, v in obj.items())
+        if isinstance(obj, list):
+            return any(self._has_key(v, key) for v in obj)
+        return False
+
+    def test_downloaded_tamper_detected(self):
+        cid, did = self.decided()
+        aid = self.ready_archive(did)
+        pkg = self.get_package(aid)
+        pkg["journal"][3]["payload"] = {"hacked": True}  # 篡改下载内容
+        v = verify_package(pkg)
+        self.assertFalse(v["verified"])
+        self.assertFalse(next(c for c in v["checks"]
+                              if c["check"] == "journal_chain_intact_in_range")["passed"])
+        # 包哈希被改字段破坏
+        pkg2 = self.get_package(aid)
+        pkg2["decision_proof"]["action"] = "stop"
+        self.assertFalse(verify_package(pkg2)["verified"])
+
+    # ------------------------------------------------ 中断续传不混入后续日志
+    def test_crash_resume_never_mixes_later_logs(self):
+        cid, did = self.decided()
+        r = self.svc.archives.request_archive(AUD_KEY, did)
+        aid = r["archive"]["archive_id"]
+        pinned_to = r["archive"]["log_range"]["seq_to"]
+        pinned_head = r["archive"]["log_range"]["head_hash"]
+        # 模拟崩溃：日志阶段开始前中断
+        b1 = self.svc.archives.build_archive(AUD_KEY, aid, simulate_crash_after=0)
+        self.assertTrue(b1["interrupted"])
+        self.assertEqual(b1["archive"]["status"], "building")
+        self.assertEqual(b1["archive"]["progress"]["built_upto_seq"], 0)
+        # 中断期间出现后续日志（迟到 AE → 新事件入链）
+        sids = [s["id"] for s in self.svc.get_cohort(cid)["subjects"]]
+        self.svc.report_ae("test", cid, sids[0], "迟报事件", "grade3",
+                           "2026-10-20T00:00:00+00:00")
+        self.assertGreater(self.head_seq(), pinned_to)
+        # 续传：严格限定固定区间，后续日志绝不混入
+        b2 = self.svc.archives.build_archive(AUD_KEY, aid)
+        self.assertEqual(b2["archive"]["status"], "ready")
+        pkg = self.get_package(aid)
+        self.assertEqual(len(pkg["journal"]), pinned_to)
+        self.assertEqual(max(e["seq"] for e in pkg["journal"]), pinned_to)
+        self.assertEqual(pkg["log_range"]["head_hash"], pinned_head)
+        self.assertFalse(any(e["event_type"] == "ae_reported"
+                             and e["payload"].get("term") == "迟报事件"
+                             for e in pkg["journal"]))
+        self.assertTrue(verify_package(pkg)["verified"])
+
+    # ------------------------------------------------ 失败与重试
+    def test_failed_build_and_retry_same_range(self):
+        cid, did = self.decided()
+        r = self.svc.archives.request_archive(AUD_KEY, did)
+        aid = r["archive"]["archive_id"]
+        pinned_to = r["archive"]["log_range"]["seq_to"]
+        b1 = self.svc.archives.build_archive(AUD_KEY, aid, simulate_fail=True)
+        self.assertEqual(b1["archive"]["status"], "failed")
+        self.assertIn("模拟", b1["archive"]["error"])
+        # 重试仍在同一固定区间内成功
+        b2 = self.svc.archives.build_archive(AUD_KEY, aid)
+        self.assertEqual(b2["archive"]["status"], "ready")
+        pkg = self.get_package(aid)
+        self.assertEqual(len(pkg["journal"]), pinned_to)
+        self.assertTrue(verify_package(pkg)["verified"])
+
+    def test_corruption_during_build_fails(self):
+        cid, did = self.decided()
+        r = self.svc.archives.request_archive(AUD_KEY, did)
+        aid = r["archive"]["archive_id"]
+        # 请求后篡改区间内日志 → 生成时哈希衔接校验失败
+        self.conn.execute(
+            "UPDATE journal SET payload=? WHERE event_type='cohort_frozen' LIMIT 1",
+            (json.dumps({"hacked": True}),))
+        b = self.svc.archives.build_archive(AUD_KEY, aid)
+        self.assertEqual(b["archive"]["status"], "failed")
+        self.assertIn("哈希链", b["archive"]["error"])
+
+    # ------------------------------------------------ 新安全事实：提示 + 取代，旧包不改写
+    def test_new_facts_hint_renew_supersedes_old_untouched(self):
+        cid, did = self.decided()
+        aid1 = self.ready_archive(did)
+        pkg1_before = self.get_package(aid1)
+        # 决定后出现新的安全事实（迟到 AE）
+        sids = [s["id"] for s in self.svc.get_cohort(cid)["subjects"]]
+        self.svc.report_ae("test", cid, sids[1], "迟报 DLT", "grade3",
+                           "2026-10-20T00:00:00+00:00")
+        view = self.svc.archives.get_archive(AUD_KEY, aid1)
+        self.assertTrue(view["freshness"]["stale"])
+        self.assertEqual(view["freshness"]["new_material_events"], 1)
+        self.assertIn("覆盖新区间", view["freshness"]["hint"])
+        # 旧包不被改写，仍可独立验真
+        self.assertEqual(self.get_package(aid1), pkg1_before)
+        self.assertTrue(verify_package(pkg1_before)["verified"])
+        # 迟到 AE 使快照失效：原证明校验的时效项失败（既有语义），但归档闸口不把它当损坏
+        self.assertFalse(self.svc.verify_proof(did)["verified"])
+        r2 = self.svc.archives.request_archive(AUD_KEY, did, renew=True)
+        a2 = r2["archive"]
+        self.assertFalse(r2["replayed"])
+        self.assertGreater(a2["log_range"]["seq_to"],
+                           view["log_range"]["seq_to"])  # 新归档覆盖新区间
+        old = self.svc.archives.get_archive(AUD_KEY, aid1)
+        self.assertEqual(old["status"], "superseded")
+        self.assertEqual(old["superseded_by"], a2["archive_id"])
+        self.assertIsNone(old["freshness"])  # 被取代后不再提示
+        # 新归档生成并验真；旧包仍可下载（内容不变）
+        self.svc.archives.build_archive(AUD_KEY, a2["archive_id"])
+        pkg2 = self.get_package(a2["archive_id"])
+        self.assertTrue(verify_package(pkg2)["verified"])
+        self.assertTrue(any(e["event_type"] == "ae_reported"
+                            and e["payload"].get("term") == "迟报 DLT"
+                            for e in pkg2["journal"]))  # 新区间包含新事实
+        self.assertEqual(self.get_package(aid1), pkg1_before)
+
+    def test_renew_in_progress_rejected(self):
+        cid, did = self.decided()
+        self.svc.archives.request_archive(AUD_KEY, did)
+        with self.assertRaises(Conflict) as cm:
+            self.svc.archives.request_archive(AUD_KEY, did, renew=True)
+        self.assertEqual(cm.exception.code, "archive_in_progress")
+
+    # ------------------------------------------------ 脱敏策略
+    def test_redaction_policy_hides_names_keeps_roles(self):
+        cid, did = self.decided()
+        aid = self.ready_archive(did, policy={"redact_member_names": True})
+        pkg = self.get_package(aid)
+        self.assertTrue(all(m["name"] == "[已隐藏]" for m in pkg["committee"]))
+        self.assertEqual({m["role"] for m in pkg["committee"]},
+                         {"independent", "sponsor"})  # 角色保留，法定人数可核对
+        # 证明封存件逐字保留（哈希锚定），包仍可独立验真
+        self.assertTrue(verify_package(pkg)["verified"])
+        self.assertTrue(any("姓名" in r for r in pkg["redactions"]))
+        # 不同策略 = 不同归档，可与默认策略归档共存
+        aid2 = self.ready_archive(did)
+        self.assertNotEqual(aid, aid2)
+        self.assertEqual(len(self.svc.archives.list_archives(AUD_KEY, cid)), 2)
+
+    # ------------------------------------------------ 下载前置状态
+    def test_download_requires_ready(self):
+        cid, did = self.decided()
+        r = self.svc.archives.request_archive(AUD_KEY, did)
+        with self.assertRaises(Conflict) as cm:
+            self.svc.archives.get_package(AUD_KEY, r["archive"]["archive_id"])
+        self.assertEqual(cm.exception.code, "archive_not_ready")
+
+    # ------------------------------------------------ 不影响既有链路
+    def test_archive_does_not_affect_dosing_drafts_proof(self):
+        cid, did = self.decided()
+        aid = self.ready_archive(did)
+        # 原有证明校验不受归档影响
+        self.assertTrue(self.svc.verify_proof(did)["verified"])
+        # 给药链路：派生子队列继续给药
+        child = self.svc.get_state()["cohorts"]
+        child_id = next(c["cohort_id"] for c in child
+                        if c.get("parent_decision_id") == did)
+        sids = [self.svc.enroll_subject("test", child_id)["subject_id"] for _ in range(3)]
+        self.svc.freeze_cohort("test", child_id)
+        for s in sids:
+            self.svc.record_administration("test", child_id, s,
+                                           given_at="2026-10-23T10:00:00+00:00")
+        self.svc.advance_clock("2026-11-14T10:01:00+00:00")
+        snap = self.svc.create_snapshot("test", child_id)
+        # 断网草稿链路：提交 → 产生票
+        ch = snap["content_hash"]
+        d = {"draft_id": "DR-ARCH-1", "snapshot_id": snap["snapshot_id"],
+             "member_id": "CM-DAC", "action": "escalate", "content_hash": ch,
+             "signature": self.sign("CM-DAC", snap["snapshot_id"], "escalate", ch),
+             "expected_version": 0}
+        r = self.svc.submit_vote_draft("test", **d)
+        self.assertEqual(r["status"], "submitted")
+        # 实时投票 + 签发 + 证明校验全部照常
+        self.vote(snap["snapshot_id"], "CM-ELN", "escalate", 1)
+        d2 = self.svc.issue_decision("test", snap["snapshot_id"])
+        self.assertTrue(self.svc.verify_proof(d2["decision_id"])["verified"])
+        # 归档包依旧验真通过（链延长但完整）
+        self.assertTrue(verify_package(self.get_package(aid))["verified"])
 
 
 if __name__ == "__main__":

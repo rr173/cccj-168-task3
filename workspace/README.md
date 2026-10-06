@@ -18,6 +18,7 @@
 | **断网草稿不得绕过快照核对** | 草稿离线签名（动作+快照指纹）存本地；恢复后服务端先核对快照仍有效（迟到事件/替补/规则换版/指纹）再一次写票；`draft_id` 幂等，重复提交只回放首次结果 |
 | **紧急暂停立即阻断后续给药、保留已给药事实** | 暂停事务提交即生效（支持队列级/全试验级）；阻断的给药尝试以 `held_back=1` 留痕；`administrations` 表只追加，已给药行永不修改/删除 |
 | 决策可证明、可审计 | 哈希链事件日志（seq/prev_hash/hash）+ 快照内容哈希 + 委员 HMAC 签名；决策证明含 11 项独立校验 |
+| **归档包可复核、不可改写、续传不混日志** | 获授权稽核员发起归档时固定决定证明+日志区间 `[1, 链头]`+委员角色；同决定同策略幂等去重（服务锁+部分唯一索引）；分块生成、检查点落库，中断续传严格限定固定区间；个人密钥永不导出，包可独立验真（纯函数 12 项）；新安全事实不改写旧包，只提示创建覆盖新区间的归档（renew 取代旧归档） |
 
 规则约束：递增/扩展类决定不得超越引擎建议（`engine_disagreement`）；保守的 `stop` 永远允许；
 暂停生效期间只接受 `stop` / `continue` 投票。
@@ -65,6 +66,11 @@ python3 -m unittest tests.test_platform -v
 | GET | `/api/drafts` `/api/cohorts/{id}/drafts` | 草稿队列：submitted/expired 状态与冲突原因 |
 | POST | `/api/snapshots/{id}/decisions` | 签发决定并生成决策证明 |
 | GET | `/api/decisions/{id}` `/verify` | 决定与证明 / 11 项独立校验 |
+| POST | `/api/archives` | 发起归档（需 `X-Auditor-Key`；`request_id` 幂等，`renew` 取代旧归档） |
+| POST | `/api/archives/{id}/build` | 开始/继续生成（检查点续传；演示可注入中断/失败） |
+| GET | `/api/archives` `/api/archives/{id}` | 归档状态列表 / 单归档视图（含新安全事实提示） |
+| GET | `/api/archives/{id}/download` | 下载归档包 JSON（需稽核员密钥） |
+| POST | `/api/archives/{id}/verify` `/api/archives/verify` | 校验下载内容 / 独立验真任意包（12 项） |
 | GET | `/api/state` `/api/journal` | 全局状态 / 哈希链事件日志 |
 | POST | `/api/clock` | 推进模拟时钟（确定性演示/测试） |
 | POST | `/api/sign` | 演示用：委员 HMAC 本地签名端点 |
@@ -92,12 +98,41 @@ python3 -m unittest tests.test_platform -v
 **每张票锚定同一快照哈希**、法定人数满足（≥2 票且 ≥2 独立）、事件哈希链完整、
 动作未超越引擎。任一项失败即 `verified=false`。
 
+## 监管稽核决定归档包
+
+获授权稽核员（`auditors` 表，演示密钥 `demo-auditor-key`，经 `X-Auditor-Key` 头出示）
+可针对已签发决定发起归档，系统生成**可下载、可独立验真**的决定归档包：
+
+1. **请求时固定**：决定证明（先过完整性闸口，证明损坏即 `proof_corrupted` 拒绝）、
+   相关日志区间 `[1, 请求当时的链头]`（含链头哈希）、委员角色名册；
+2. **脱敏**：委员个人密钥（`hmac_key`）任何策略下都不导出；导出策略
+   `redact_member_names` 可隐藏名册中的委员姓名（保留编号与角色供法定人数核对；
+   决定证明是哈希锚定的封存件，逐字保留）；
+3. **幂等去重**：相同决定 + 相同导出策略（内容哈希）至多一份活跃归档——并发/重复
+   请求只回放同一份结果；`request_id` 是客户端幂等键，同键不同参数即
+   `archive_param_conflict`（409）；无权限 403；
+4. **可中断续传**：日志分块生成、每块校验哈希衔接并落检查点；中断后从检查点继续，
+   严格限定在固定区间内——**绝不混入后续日志**；失败置 `failed` 可在同一区间内重试；
+5. **独立验真**：`verify_package` 是不依赖数据库的纯函数，对下载的包重算 12 项——
+   包哈希、区间哈希链（含终点锚定）、证明哈希、快照锚定、规则引擎重算、五门、
+   法定人数（按包内名册角色）、投票锚定、动作-引擎一致性、决定事件交叉锚定、
+   无个人密钥。签名按设计不可离线重算（密钥不导出），以证明封存件内签发时的
+   校验结论为准，在线可经原证明校验端点复核；
+6. **旧包不可改写**：之后出现的新安全事实（迟到 AE/裁定/替补/给药）只在归档视图上
+   产生 `freshness` 提示，稽核员据此 `renew` 生成覆盖新区间的新归档，旧归档标记
+   `superseded` 但内容不变、仍可下载验真。
+
+工作台右栏「监管稽核归档」展示五种状态：**排队中 / 生成中 / 可下载 / 失败 /
+已被新归档取代**，并提供开始（继续）生成、下载、校验下载内容、创建覆盖新区间
+归档等操作。归档自身的事件不属于实质性事件，不影响给药、投票草稿与原有证明校验。
+
 ## 代码结构
 
 - `app/store.py` — SQLite schema、哈希链追加 `append_event`、`verify_chain`
 - `app/services.py` — 领域服务：冻结/给药/暂停/AE/缺失/替补/规则/快照/投票/断网草稿/决定/证明
+- `app/archives.py` — 监管稽核归档：授权/固定区间/幂等去重/分块续传/脱敏组装/`verify_package` 独立验真
 - `app/rules.py` — 版本化规则规格与引擎（严重度→DLT→bands→建议）
 - `app/crypto.py` — 规范 JSON / SHA-256 / HMAC
 - `app/clock.py` — 可注入时钟（观察窗判定唯一时间来源）
-- `app/server.py` + `app/web/index.html` — REST API 与安全工作台（含断网模拟与草稿队列）
-- `tests/test_platform.py` — 32 个不变量测试
+- `app/server.py` + `app/web/index.html` — REST API 与安全工作台（含断网模拟、草稿队列与稽核归档）
+- `tests/test_platform.py` — 47 个不变量测试

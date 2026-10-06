@@ -4,6 +4,7 @@
 """
 from __future__ import annotations
 
+import json
 import threading
 
 from .crypto import canonical_json, hmac_hex
@@ -231,6 +232,61 @@ def main():
     print(f"  决定 {d2['decision_id']}: {d2['action']}；证明校验 verified={v2['verified']}")
     q = svc.list_vote_drafts(cid2)
     print("  草稿队列：", ", ".join(f"{x['draft_id']}={x['status']}" for x in q))
+
+    line("14. 监管稽核归档：固定证明+日志区间 → 可下载、可独立验真的归档包")
+    from .archives import verify_package
+    AUD = "demo-auditor-key"
+    expect_conflict("无稽核员密钥发起归档",
+                    lambda: svc.archives.request_archive(None, d2["decision_id"]))
+    r = svc.archives.request_archive(AUD, d2["decision_id"],
+                                     policy={"redact_member_names": True},
+                                     request_id="ARQ-DEMO-1")
+    a = r["archive"]
+    print(f"  稽核员 AUD-01 发起归档 {a['archive_id']}：status={a['status']}，"
+          f"日志区间 1..{a['log_range']['seq_to']} 已固定")
+    r_dup = svc.archives.request_archive(AUD, d2["decision_id"],
+                                         policy={"redact_member_names": True},
+                                         request_id="ARQ-DEMO-1")
+    print(f"  重复请求：replayed={r_dup['replayed']}，"
+          f"同一归档={r_dup['archive']['archive_id'] == a['archive_id']}（只生成一份结果）")
+    expect_conflict("同一 request_id 携带不同策略",
+                    lambda: svc.archives.request_archive(
+                        AUD, d2["decision_id"], request_id="ARQ-DEMO-1"))
+    aid = a["archive_id"]
+    b1 = svc.archives.build_archive(AUD, aid, simulate_crash_after=1)
+    print(f"  模拟中断：status={b1['archive']['status']}，检查点 "
+          f"built_upto_seq={b1['archive']['progress']['built_upto_seq']}")
+    svc.advance_clock("2026-11-15T09:00:00+00:00")  # 中断期间链继续前进
+    b2 = svc.archives.build_archive(AUD, aid)  # 续传
+    pkg = json.loads(svc.archives.get_package(AUD, aid))
+    print(f"  续传完成：status={b2['archive']['status']}，包内日志 "
+          f"{len(pkg['journal'])} 条（止于固定 seq={pkg['log_range']['seq_to']}，"
+          "后续日志未混入）")
+    vp = verify_package(pkg)
+    print(f"  独立验真（纯函数、不查库）：verified={vp['verified']}，"
+          f"{sum(1 for c in vp['checks'] if c['passed'])}/{len(vp['checks'])} 项")
+    print(f"  脱敏：{pkg['redactions'][-1]}")
+
+    line("15. 新安全事实不改写旧包：提示覆盖新区间，新归档取代旧归档")
+    svc.report_ae("crc", cid2, sids2[0], "迟报：肝酶升高", "grade3",
+                  "2026-11-12T00:00:00+00:00")
+    view = svc.archives.get_archive(AUD, aid)
+    print(f"  归档视图提示：stale={view['freshness']['stale']}，{view['freshness']['hint']}")
+    old_hash = pkg["package_hash"]
+    r3 = svc.archives.request_archive(AUD, d2["decision_id"],
+                                      policy={"redact_member_names": True}, renew=True)
+    a3 = r3["archive"]
+    print(f"  renew → 新归档 {a3['archive_id']} 覆盖区间 1..{a3['log_range']['seq_to']}；"
+          f"旧归档状态={svc.archives.get_archive(AUD, aid)['status']}")
+    svc.archives.build_archive(AUD, a3["archive_id"])
+    pkg3 = json.loads(svc.archives.get_package(AUD, a3["archive_id"]))
+    print(f"  新归档验真 verified={verify_package(pkg3)['verified']}，"
+          f"包含迟到事件={any(e['event_type'] == 'ae_reported' and '肝酶' in e['payload'].get('term', '') for e in pkg3['journal'])}")
+    old_again = json.loads(svc.archives.get_package(AUD, aid))
+    print(f"  旧包未被改写：hash 一致={old_again['package_hash'] == old_hash}，"
+          f"仍可独立验真={verify_package(old_again)['verified']}")
+    print(f"  既有链路不受影响：原证明校验 11 项中仅时效项变化"
+          f"（snapshot_not_superseded_now={next(c['passed'] for c in svc.verify_proof(d2['decision_id'])['checks'] if c['check'] == 'snapshot_not_superseded_now')}，属既有语义）")
 
 
 if __name__ == "__main__":

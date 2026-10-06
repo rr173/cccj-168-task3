@@ -9,6 +9,7 @@ import json
 import os
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import parse_qs, urlparse
 
 from .crypto import canonical_json, hmac_hex
 from .errors import DomainError
@@ -55,13 +56,35 @@ def build_server(db_path: str, host: str = "127.0.0.1", port: int = 8080):
             self.end_headers()
             self.wfile.write(body)
 
+        def _download(self, package_json: str, archive_id: str):
+            body = package_json.encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Disposition",
+                             f'attachment; filename="archive-{archive_id}.json"')
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
         def do_GET(self):
             path = self.path.split("?")[0]
+            query = parse_qs(urlparse(self.path).query)
+            auditor_key = self.headers.get("X-Auditor-Key")
             try:
                 if path == "/api/state":
                     self._send(svc.get_state())
                 elif path == "/api/drafts":
                     self._send({"drafts": svc.list_vote_drafts()})
+                elif path == "/api/archives":
+                    cohort = query.get("cohort_id", [None])[0]
+                    self._send({"archives": svc.archives.list_archives(auditor_key, cohort)})
+                elif path.startswith("/api/archives/"):
+                    parts = path.split("/")
+                    aid = parts[3]
+                    if len(parts) == 5 and parts[4] == "download":
+                        self._download(svc.archives.get_package(auditor_key, aid), aid)
+                    else:
+                        self._send(svc.archives.get_archive(auditor_key, aid))
                 elif path.startswith("/api/cohorts/"):
                     parts = path.split("/")
                     if len(parts) == 5 and parts[4] == "drafts":
@@ -110,7 +133,27 @@ def build_server(db_path: str, host: str = "127.0.0.1", port: int = 8080):
 
         def _route_post(self, path: str, actor: str, d: dict):
             s = svc
-            if path == "/api/trials":
+            akey = self.headers.get("X-Auditor-Key") or d.get("auditor_key")
+            if path == "/api/archives":
+                # 发起归档：获授权稽核员 + 固定日志区间；同决定同策略幂等回放
+                r = s.archives.request_archive(
+                    akey, d["decision_id"], d.get("policy"),
+                    d.get("request_id"), bool(d.get("renew", False)))
+                self._send(r, 200 if r["replayed"] else 201)
+            elif path == "/api/archives/verify":
+                # 独立验真任意下载的归档包（不依赖库内副本）
+                self._send(s.archives.verify_archive(akey, None, d.get("package")))
+            elif path.startswith("/api/archives/") and path.endswith("/build"):
+                # 开始/继续生成：中断后从检查点续传，严格限定固定日志区间
+                self._send(s.archives.build_archive(
+                    akey, path.split("/")[3],
+                    d.get("simulate_crash_after"),
+                    bool(d.get("simulate_fail", False))))
+            elif path.startswith("/api/archives/") and path.endswith("/verify"):
+                # 校验下载内容：body.package 为下载的包；缺省校验库内包
+                self._send(s.archives.verify_archive(
+                    akey, path.split("/")[3], d.get("package")))
+            elif path == "/api/trials":
                 self._send(s.create_trial(actor, d["title"]), 201)
             elif path == "/api/cohorts":
                 self._send(s.create_cohort(

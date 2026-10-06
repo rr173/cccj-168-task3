@@ -20,6 +20,7 @@ import uuid
 from datetime import timedelta
 
 from . import rules
+from .archives import ArchiveService
 from .clock import now_utc, now_iso, parse_iso, set_clock
 from .crypto import canonical_json, canonical_hash, verify_hmac
 from .errors import Conflict, DomainError, NotFound, ValidationFailed
@@ -45,6 +46,8 @@ class Services:
         self.conn = conn
         # 同一连接被多线程直接使用时（HTTP 层另有写锁），保证 CAS 检查-写入原子性
         self._lock = threading.RLock()
+        # 监管稽核归档：复用本服务的证明校验与锁，事件追加共用同一连接
+        self.archives = ArchiveService(conn, self.verify_proof, self._lock)
 
     # ------------------------------------------------------------------ 引导
     def bootstrap(self) -> dict:
@@ -70,6 +73,12 @@ class Services:
         if self.conn.execute("SELECT COUNT(*) c FROM rulesets").fetchone()["c"] == 0:
             self._publish_ruleset(rules.DEFAULT_SPEC, "system",
                                   "首版规则：≥3 级可评估 AE 计 DLT，标准 3+3 区间", created=False)
+        if self.conn.execute("SELECT COUNT(*) c FROM auditors").fetchone()["c"] == 0:
+            # 演示稽核员（与委员会/操作角色分离的归档授权主体）
+            self.conn.execute(
+                "INSERT INTO auditors(auditor_id,name,api_key,active,created_at)"
+                " VALUES('AUD-01','林岚（监管稽核员）','demo-auditor-key',1,?)",
+                (now_iso(self.conn),))
         self.conn.commit()
         return {"members": created}
 
